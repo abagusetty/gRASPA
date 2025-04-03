@@ -298,19 +298,19 @@ static inline double GetPrefactor(Components& SystemComponents, Simulations& Sim
   {
     case INSERTION: case SINGLE_INSERTION:
     {
-      preFactor = SystemComponents.Beta * MolFraction * Sims.Box.Pressure * FugacityCoefficient * Sims.Box.Volume / (1.0+NumberOfMolecules);
+      preFactor = SystemComponents.Beta * MolFraction * SystemComponents.Pressure * FugacityCoefficient * Sims.Box.Volume / (1.0+NumberOfMolecules);
       break;
     }
     case DELETION: case SINGLE_DELETION:
     {
-      preFactor = (NumberOfMolecules) / (SystemComponents.Beta * MolFraction * Sims.Box.Pressure * FugacityCoefficient * Sims.Box.Volume);
+      preFactor = (NumberOfMolecules) / (SystemComponents.Beta * MolFraction * SystemComponents.Pressure * FugacityCoefficient * Sims.Box.Volume);
       break;
     }
     case IDENTITY_SWAP:
     {
       throw std::runtime_error("Sorry, but no IDENTITY_SWAP OPTION for now. That move uses its own function\n");
     }
-    case TRANSLATION: case ROTATION:
+    case TRANSLATION: case ROTATION: case SPECIAL_ROTATION: 
     {
       preFactor = 1.0;
     }
@@ -351,7 +351,7 @@ static inline void AcceptInsertion(Components& SystemComponents, Simulations& Si
   Update_NumberOfMolecules(SystemComponents, Sims.d_a, SelectedComponent, INSERTION); //true = Insertion//
   if(!noCharges && SystemComponents.hasPartialCharge[SelectedComponent])
   {
-    Update_Ewald_Vector(Sims.Box, false, SystemComponents);
+    Update_Vector_Ewald(Sims.Box, false, SystemComponents);
   }
 }
 
@@ -373,7 +373,7 @@ static inline void AcceptDeletion(Components& SystemComponents, Simulations& Sim
   Update_NumberOfMolecules(SystemComponents, Sims.d_a, SelectedComponent, DELETION); //false = Deletion//
   if(!noCharges && SystemComponents.hasPartialCharge[SelectedComponent])
   {
-    Update_Ewald_Vector(Sims.Box, false, SystemComponents);
+    Update_Vector_Ewald(Sims.Box, false, SystemComponents);
   }
 
   //Zhao's note: the last molecule can be the fractional molecule, (fractional molecule ID is stored on the host), we need to update it as well (at least check it)//

@@ -11,17 +11,13 @@
 //This might be a point where debugging is needed//
 void Setup_threadblock(size_t arraysize, size_t *Nblock, size_t *Nthread)
 {
-  if(arraysize == 0)  return;
-  size_t value = arraysize;
-  if(value >= DEFAULTTHREAD) value = DEFAULTTHREAD;
-  double ratio = (double)arraysize/value;
-  size_t blockValue = ceil(ratio);
-  if(blockValue == 0) blockValue++;
   //Zhao's note: Default thread should always be 64, 128, 256, 512, ...
   // This is because we are using partial sums, if arraysize is smaller than defaultthread, we need to make sure that
   //while Nthread is dividing by 2, it does not generate ODD NUMBER (for example, 5/2 = 2, then element 5 will be ignored)//
+  if(arraysize == 0)  return;
   *Nthread = DEFAULTTHREAD;
-  *Nblock = blockValue;
+  *Nblock = arraysize/(*Nthread);
+  if(arraysize % (*Nthread) > 0) (*Nblock)++;
 }
 
 void VDWReal_Total_CPU(Boxsize Box, Atoms* Host_System, Atoms* System, ForceField FF, Components SystemComponents, MoveEnergy& E)
@@ -89,7 +85,7 @@ void VDWReal_Total_CPU(Boxsize Box, Atoms* Host_System, Atoms* System, ForceFiel
     const Atoms Component=Host_System[compi];
     for(size_t i=0; i<Component.size; i++)
     {
-      //printf("comp: %zu, i: %zu, x: %.10f\n", compi, i, Component.pos[i].x);
+      //printf("comp: %zu, i: %zu, x: %.10f\n", compi, i, Component.pos[i].x());
       const double scaleA = Component.scale[i];
       const double chargeA = Component.charge[i];
       const double scalingCoulombA = Component.scaleCoul[i];
@@ -466,7 +462,7 @@ void Calculate_Multiple_Trial_Energy_SEPARATE_HostGuest_VDWReal(Boxsize Box, Ato
   ///////////////////////////////////////////////////////
   //All variables passed here should be device pointers//
   ///////////////////////////////////////////////////////
-  //auto sdata = (double *)dpct_local;
+
   const size_t blockIdx  = item.get_group(0);
   const size_t blockDim  = item.get_local_range(0);
   const size_t threadIdx = item.get_local_id(0);
@@ -562,9 +558,10 @@ void Calculate_Multiple_Trial_Energy_SEPARATE_HostGuest_VDWReal(Boxsize Box, Ato
 
     if(ConsiderThisMolecule)
     {
-      double3 pos1 = static_cast<double3>(Component.pos[posi] );
-      double3 pos2 =  static_cast<double3>( NewMol.pos[j]);
-      double3 posvec = pos1 - pos2;
+      double3 posvec = Component.pos[posi] - NewMol.pos[j];
+      // double3 pos1 = static_cast<double3>(Component.pos[posi] );
+      // double3 pos2 =  static_cast<double3>( NewMol.pos[j]);
+      // double3 posvec = pos1 - pos2;
       PBC(posvec, Box.Cell, Box.InverseCell, Box.Cubic);
       const double rr_dot = dot(posvec, posvec);
       if(rr_dot < FF.CutOffVDW)
@@ -605,20 +602,20 @@ void Calculate_Multiple_Trial_Energy_SEPARATE_HostGuest_VDWReal(Boxsize Box, Ato
     sdata[threadIdx] = tempy.x(); sdata[threadIdx + blockDim] = tempy.y();
   }
   }
-   item.barrier(sycl::access::fence_space::local_space);
+  item.barrier(sycl::access::fence_space::local_space);
   //Partial block sum//
-  if(!flag[trial])
-  {
-    int i=blockDim / 2;
-    while(i != 0) 
+  //if(!Blockflag)
+  //{
+    int reductionsize=blockDim / 2;
+    while(reductionsize != 0) 
     {
-      if(cache_id < i) 
+      if(cache_id < reductionsize) 
       {
-        sdata[cache_id] += sdata[cache_id + i];
-        sdata[cache_id + blockDim] += sdata[cache_id + i + blockDim];
+        sdata[cache_id] += sdata[cache_id + reductionsize];
+        sdata[cache_id + blockDim] += sdata[cache_id + reductionsize + blockDim];
       }
       item.barrier();
-      i /= 2;
+      reductionsize /= 2;
     }
     if(cache_id == 0) 
     {
@@ -627,208 +624,509 @@ void Calculate_Multiple_Trial_Energy_SEPARATE_HostGuest_VDWReal(Boxsize Box, Ato
      //if(trial_blockID >= HG_Nblock) 
     //printf("GG, trial: %lu, BlockID: %lu, data: %.5f\n", trial, blockIdx, sdata[0]);
     }
-  }
+  //}
 }
 
 
-void VDWCoulEnergy_Total(Boxsize Box, Atoms ComponentA, Atoms ComponentB, size_t Aij, size_t Bij, ForceField FF, bool* flag, bool& Blockflag, double& tempy, size_t NA, size_t NB, bool UseOffset)
+// ABB: THis needs edits to look similar like CUDA's version
+__attribute__((always_inline))
+void VDWCoulEnergy_Total(Boxsize Box, Atoms ComponentA, Atoms ComponentB, ForceField FF, bool* flag, double2& tempy, size_t posA, size_t posB, size_t compA, size_t compB, bool UseOffset)
+//void VDWCoulEnergy_Total(Boxsize Box, Atoms ComponentA, Atoms ComponentB, size_t Aij, size_t Bij, ForceField FF, bool* flag, bool& Blockflag, double& tempy, size_t NA, size_t NB, bool UseOffset)
 {
-  for(size_t i = 0; i < NA; i++)
-  {
-          size_t OffsetA         = 0;
-          size_t posi            = i + Aij;
-          if(UseOffset) OffsetA  = ComponentA.Allocate_size / 2; //Read the positions shifted to the later half of the storage//
-    //Zhao's note: add protection here//
-    if(posi >= ComponentA.size) continue;
-    const double scaleA          = ComponentA.scale[posi];
-    const double chargeA         = ComponentA.charge[posi];
-    const double scalingCoulombA = ComponentA.scaleCoul[posi];
-    const size_t typeA           = ComponentA.Type[posi];
+  //compA may go beyond the bound, if this happens, check if compA + 1 goes beyond endcompA//
+  size_t OffsetA         = 0;
+  if(UseOffset) OffsetA  = ComponentA.Allocate_size / 2; //Read the positions shifted to the later half of the storage//
+  const double scaleA          = ComponentA.scale[posA];
+  const double chargeA         = ComponentA.charge[posA];
+  const double scalingCoulombA = ComponentA.scaleCoul[posA];
+  const size_t typeA           = ComponentA.Type[posA];
 
-    const double3 PosA = ComponentA.pos[posi + OffsetA];
-    for(size_t j = 0; j < NB; j++)
+  const double3 PosA = ComponentA.pos[posA + OffsetA];
+
+  size_t OffsetB         = 0;
+  if(UseOffset) OffsetB  = ComponentB.Allocate_size / 2; //Read the positions shifted to the later half of the storage//
+  const double scaleB          = ComponentB.scale[posB];
+  const double chargeB         = ComponentB.charge[posB];
+  const double scalingCoulombB = ComponentB.scaleCoul[posB];
+  const size_t typeB           = ComponentB.Type[posB];
+  const double3 PosB = ComponentB.pos[posB + OffsetB];
+
+  //printf("thread: %lu, i:%lu, j:%lu, comp: %lu, posi: %lu\n", ij,i,j,comp, posi);
+  double3 posvec = PosA - PosB;
+  PBC(posvec, Box.Cell, Box.InverseCell, Box.Cubic);
+  const double rr_dot = dot(posvec, posvec);
+  if(rr_dot < FF.CutOffVDW)
+  {
+    double result[2] = {0.0, 0.0};
+    const double scaling = scaleA * scaleB;
+    const size_t row = typeA*FF.size+typeB;
+    const double FFarg[4] = {FF.epsilon[row], FF.sigma[row], FF.z[row], FF.shift[row]};
+    VDW(FFarg, rr_dot, scaling, result);
+    if(result[0] > FF.OverlapCriteria){ flag[0]=true;}
+    if(rr_dot < 0.01) { flag[0]=true; } //DistanceCheck//
+    //if(result[0] > FF.OverlapCriteria || rr_dot < 0.01) printf("OVERLAP IN KERNEL!\n");
+    tempy.x() += result[0];
+  }
+  //Coulombic (REAL)//
+  if (!FF.noCharges && rr_dot < FF.CutOffCoul)
+  {
+    const double r = sqrt(rr_dot);
+    const double scalingCoul = scalingCoulombA * scalingCoulombB;
+    double resultCoul[2] = {0.0, 0.0};
+    CoulombReal(chargeA, chargeB, r, scalingCoul, resultCoul, Box.Prefactor, Box.Alpha);
+    tempy.y() += resultCoul[0]; //prefactor merged in the CoulombReal function
+  }
+
+  
+  // for(size_t i = 0; i < NA; i++)
+  // {
+  //         size_t OffsetA         = 0;
+  //         size_t posi            = i + Aij;
+  //         if(UseOffset) OffsetA  = ComponentA.Allocate_size / 2; //Read the positions shifted to the later half of the storage//
+  //   //Zhao's note: add protection here//
+  //   if(posi >= ComponentA.size) continue;
+  //   const double scaleA          = ComponentA.scale[posi];
+  //   const double chargeA         = ComponentA.charge[posi];
+  //   const double scalingCoulombA = ComponentA.scaleCoul[posi];
+  //   const size_t typeA           = ComponentA.Type[posi];
+
+  //   const double3 PosA = ComponentA.pos[posi + OffsetA];
+  //   for(size_t j = 0; j < NB; j++)
+  //   {
+  //           size_t OffsetB         = 0;
+  //           size_t posj            = j + Bij;
+  //           if(UseOffset) OffsetB  = ComponentB.Allocate_size / 2; //Read the positions shifted to the later half of the storage//
+  //     //Zhao's note: add protection here//
+  //     //if(posj >= ComponentB.size) continue;
+  //     const double scaleB          = ComponentB.scale[posj];
+  //     const double chargeB         = ComponentB.charge[posj];
+  //     const double scalingCoulombB = ComponentB.scaleCoul[posj];
+  //     const size_t typeB           = ComponentB.Type[posj];
+  //     //if(j == 6) printf("PAIR CHECK: i: %lu, j: %lu, MoleculeID: %lu, NewMol.MolID: %lu\n", i,j,MoleculeID, NewMol.MolID[0]);
+  //     const double3 PosB = ComponentB.pos[posj + OffsetB];
+  //     double3 posvec = static_cast<double3>(PosA) - static_cast<double3>(PosB);
+  //     //printf("thread: %lu, i:%lu, j:%lu, comp: %lu, posi: %lu\n", ij,i,j,comp, posi);
+  //     PBC(posvec, Box.Cell, Box.InverseCell, Box.Cubic);
+  //     const double rr_dot = dot(posvec, posvec);
+  //     if(rr_dot < FF.CutOffVDW)
+  //     {
+  //       double result[2] = {0.0, 0.0};
+  //       const double scaling = scaleA * scaleB;
+  //       const size_t row = typeA*FF.size+typeB;
+  //       //printf("typeA: %lu, typeB: %lu, FF.size: %lu, row: %lu\n", typeA, typeB, FF.size, row);
+  //       const double FFarg[4] = {FF.epsilon[row], FF.sigma[row], FF.z[row], FF.shift[row]};
+  //       VDW(FFarg, rr_dot, scaling, result);
+  //       if(result[0] > FF.OverlapCriteria){ flag[0]=true; Blockflag = true;}
+  //       if(rr_dot < 0.01) { flag[0]=true; Blockflag = true; } //DistanceCheck//
+  //       if(result[0] > FF.OverlapCriteria || rr_dot < 0.01) printf("OVERLAP IN KERNEL!\n");
+  //       tempy += result[0];
+  //     }
+  //     //Coulombic (REAL)//
+  //     if (!FF.noCharges && rr_dot < FF.CutOffCoul)
+  //     {
+  //       const double r = sqrt(rr_dot);
+  //       const double scalingCoul = scalingCoulombA * scalingCoulombB;
+  //       double resultCoul[2] = {0.0, 0.0};
+  //       CoulombReal(chargeA, chargeB, r, scalingCoul, resultCoul, Box.Prefactor, Box.Alpha);
+  //       tempy += resultCoul[0]; //prefactor merged in the CoulombReal function
+  //     }
+  //   }
+  // }
+}
+
+// void TotalVDWCoul(Boxsize Box, Atoms* System, ForceField FF, double* Blocksum, bool* flag, size_t totalthreads, size_t Host_threads, size_t NAds, size_t NFrameworkAtomsPerThread, bool HostHost, bool UseOffset)
+// {
+//   extern double sdata[]; //shared memory for partial sum//
+//   int cache_id = threadIdx.x; 
+//   size_t total_ij = blockIdx.x * blockDim.x + threadIdx.x;
+ 
+//   size_t ij_within_block = total_ij - blockIdx.x * blockDim.x;
+//   sdata[ij_within_block] = 0.0;
+
+//   //Initialize Blocksum//
+//   if(cache_id == 0) Blocksum[blockIdx.x] = 0.0;
+//   bool Blockflag = false;
+ 
+//   if(total_ij < totalthreads)
+//   {
+//     size_t totalsize = 0;
+//     const size_t NumberComp = 2; //Zhao's note: need to change here for multicomponent
+//     //Aij and Bij indicate the starting positions for the objects in the pairwise interaction//
+//     size_t Aij   = 0; size_t Bij   = 0;
+//     size_t MolA  = 0; size_t MolB  = 0;
+//     size_t compA = 0; size_t compB = 0;
+//     size_t NA    = 0; size_t NB    = 0;
+//     if(total_ij < Host_threads) //This thread belongs to the Host_threads//
+//     {
+//       MolA = 0;
+//       Aij  = total_ij / NAds * NFrameworkAtomsPerThread;
+//       MolB = total_ij % NAds;
+//       NA  = NFrameworkAtomsPerThread;
+//       if(total_ij == Host_threads - 1) 
+//         if(Host_threads % NFrameworkAtomsPerThread != 0)
+//           NA = Host_threads % NFrameworkAtomsPerThread; 
+//       if(!HostHost) compB = 1; //If we do not consider host-host, start with host-guest
+//       //Here we need to determine the Molecule ID and which component the molecule belongs to//
+      
+//       for(size_t ijk = compB; ijk < NumberComp; ijk++)
+//       {
+//         size_t Mol_ijk = System[ijk].size / System[ijk].Molsize;
+//         totalsize     += Mol_ijk;
+//         if(MolB >= totalsize)
+//         {
+//           compB++;
+//           MolB -= Mol_ijk;
+//         }
+//       }
+//       NB = System[compB].Molsize;
+//       Bij = MolB * NB;
+//     }
+//     else //Adsorbate-Adsorbate//
+//     { 
+//       compA = 1; compB = 1;
+//       size_t Ads_i = total_ij - Host_threads;
+//       //https://stackoverflow.com/questions/27086195/linear-index-upper-triangular-matrix
+//       MolA = NAds - 2 - std::floor(std::sqrt(-8*Ads_i + 4*NAds*(NAds-1)-7)/2.0 - 0.5);
+//       MolB = Ads_i + MolA + 1 - NAds*(NAds-1)/2 + (NAds-MolA)*((NAds- MolA)-1)/2;
+//       totalsize = 0;
+//       //Determine the Molecule IDs and the component of MolA and MolB//
+//       for(size_t ijk = 1; ijk < NumberComp; ijk++)
+//       {
+//         size_t Mol_ijk = System[ijk].size / System[ijk].Molsize;
+//         totalsize     += Mol_ijk;
+//         if(MolA >= totalsize)
+//         {
+//           compA++;
+//           MolA -= Mol_ijk;
+//         }
+//       }
+//       NA = System[compA].Molsize;
+//       totalsize = 0;
+//       for(size_t ijk = 1; ijk < NumberComp; ijk++)
+//       {
+//         size_t Mol_ijk = System[ijk].size / System[ijk].Molsize;
+//         totalsize     += Mol_ijk;
+//         if(MolB >= totalsize)
+//         {
+//           compB++;
+//           MolB -= Mol_ijk;
+//         }
+//       }
+//       NB = System[compB].Molsize;
+//       Aij = MolA * NA; Bij = MolB * NB;
+//     }
+//     //printf("Thread: %lu, compA: %lu, compB: %lu, MolA: %lu, MolB: %lu, Aij: %lu, Bij: %lu, Molsizes: %lu %lu\n", total_ij, compA, compB, MolA, MolB, Aij, Bij, System[0].Molsize, System[1].Molsize);
+
+//     sdata[ij_within_block] = 0.0;
+//     //Initialize Blocksum//
+//     if(cache_id == 0) Blocksum[blockIdx.x] = 0.0;
+
+//     // Manually fusing/collapsing the loop //
+
+//     const Atoms ComponentA=System[compA];
+//     const Atoms ComponentB=System[compB];
+//     double tempy = 0.0;
+//     VDWCoulEnergy_Total(Box, ComponentA, ComponentB, Aij, Bij, FF, flag, Blockflag, tempy, NA, NB, UseOffset);
+//     sdata[ij_within_block] = tempy;
+//     //printf("ThreadID: %lu, HostThread: %lu, compA: %lu, compB: %lu, Aij: %lu, Bij: %lu, NA: %lu, NB: %lu, tempy: %.5f\n", total_ij, Host_threads, compA, compB, Aij, Bij, NA, NB, tempy);
+//   }
+//   __syncthreads();
+//   //Partial block sum//
+//   if(!Blockflag)
+//   {
+//     int i=blockDim.x / 2;
+//     while(i != 0) 
+//     {
+//       if(cache_id < i) {sdata[cache_id] += sdata[cache_id + i];}
+//       __syncthreads();
+//       i /= 2;
+//     }
+//     if(cache_id == 0) {Blocksum[blockIdx.x] = sdata[0];}
+//   }
+//   else
+//     flag[0] = true;
+// }
+
+__attribute__((always_inline))
+void determine_comp_and_Atomindex_from_thread(Atoms* System, size_t& Atom, size_t& comp, size_t startComponent, size_t endComponent)
+{
+  /*
+  //size_t count = Atom;
+  comp = startComponent;
+  for(size_t ijk = startComponent; ijk < endComponent; ijk++)
+  {
+    //totalsize += d_a[ijk].size;
+    if(Atom >= System[ijk].size)
     {
-            size_t OffsetB         = 0;
-            size_t posj            = j + Bij;
-            if(UseOffset) OffsetB  = ComponentB.Allocate_size / 2; //Read the positions shifted to the later half of the storage//
-      //Zhao's note: add protection here//
-      //if(posj >= ComponentB.size) continue;
-      const double scaleB          = ComponentB.scale[posj];
-      const double chargeB         = ComponentB.charge[posj];
-      const double scalingCoulombB = ComponentB.scaleCoul[posj];
-      const size_t typeB           = ComponentB.Type[posj];
-      //if(j == 6) printf("PAIR CHECK: i: %lu, j: %lu, MoleculeID: %lu, NewMol.MolID: %lu\n", i,j,MoleculeID, NewMol.MolID[0]);
-      const double3 PosB = ComponentB.pos[posj + OffsetB];
-      double3 posvec = static_cast<double3>(PosA) - static_cast<double3>(PosB);
-      //printf("thread: %lu, i:%lu, j:%lu, comp: %lu, posi: %lu\n", ij,i,j,comp, posi);
-      PBC(posvec, Box.Cell, Box.InverseCell, Box.Cubic);
-      const double rr_dot = dot(posvec, posvec);
-      if(rr_dot < FF.CutOffVDW)
-      {
-        double result[2] = {0.0, 0.0};
-        const double scaling = scaleA * scaleB;
-        const size_t row = typeA*FF.size+typeB;
-        //printf("typeA: %lu, typeB: %lu, FF.size: %lu, row: %lu\n", typeA, typeB, FF.size, row);
-        const double FFarg[4] = {FF.epsilon[row], FF.sigma[row], FF.z[row], FF.shift[row]};
-        VDW(FFarg, rr_dot, scaling, result);
-        if(result[0] > FF.OverlapCriteria){ flag[0]=true; Blockflag = true;}
-        if(rr_dot < 0.01) { flag[0]=true; Blockflag = true; } //DistanceCheck//
-        if(result[0] > FF.OverlapCriteria || rr_dot < 0.01) printf("OVERLAP IN KERNEL!\n");
-        tempy += result[0];
-      }
-      //Coulombic (REAL)//
-      if (!FF.noCharges && rr_dot < FF.CutOffCoul)
-      {
-        const double r = sqrt(rr_dot);
-        const double scalingCoul = scalingCoulombA * scalingCoulombB;
-        double resultCoul[2] = {0.0, 0.0};
-        CoulombReal(chargeA, chargeB, r, scalingCoul, resultCoul, Box.Prefactor, Box.Alpha);
-        tempy += resultCoul[0]; //prefactor merged in the CoulombReal function
-      }
+      Atom -= System[ijk].size;
+      comp ++;
+    }
+    else
+    {
+      //Atom = count;
+      //comp = ijk;
+      break;
     }
   }
+  */
+  size_t count = Atom;
+  comp = startComponent;
+  for(size_t ijk = startComponent; ijk < endComponent; ijk++)
+  {
+    //totalsize += d_a[ijk].size;
+    if(count >= System[ijk].size)
+    {
+      count -= System[ijk].size;
+      //comp ++;
+    }
+    else
+    {
+      Atom = count;
+      comp = ijk;
+      break;
+    }
+  }
+  //return {(int) Atom, (int) comp};
 }
-/*
-void TotalVDWCoul(Boxsize Box, Atoms* System, ForceField FF, double* Blocksum, bool* flag, size_t totalthreads, size_t Host_threads, size_t NAds, size_t NFrameworkAtomsPerThread, bool HostHost, bool UseOffset)
+
+__attribute__((always_inline))
+void TotalVDWRealCoulomb(Boxsize Box, Atoms* System, ForceField FF, double* Blocksum, bool* flag, size_t InteractionPerThread, bool UseOffset, int3 BLOCK, int3 NComponents, size_t NFrameworkAtoms, size_t NAdsorbateAtoms, size_t NFrameworkZero_ExtraFramework, bool ConsiderIntra, const sycl::nd_item<1>& item, sycl::decorated_local_ptr<double> sdata)
 {
-  extern double sdata[]; //shared memory for partial sum//
-  int cache_id = threadIdx.x; 
-  size_t total_ij = blockIdx.x * blockDim.x + threadIdx.x;
- 
-  size_t ij_within_block = total_ij - blockIdx.x * blockDim.x;
-  sdata[ij_within_block] = 0.0;
+  size_t Nblock = BLOCK.x() + BLOCK.y() + BLOCK.z();
+  size_t HH_Nblock = BLOCK.x();
+  size_t HG_Nblock = BLOCK.y();
+  //size_t GG_Nblock = BLOCK.z(); //currently not used//
+
+  size_t blockIdx  = item.get_group(0);
+  size_t blockDim  = item.get_local_range(0);
+  size_t threadIdx = item.get_local_id(0);
+  
+  int cache_id = threadIdx;
+
+  size_t THREADIdx = item.get_global_id(0); if(THREADIdx > NFrameworkZero_ExtraFramework)
+                                              
+  sdata[threadIdx] = 0.0;
+  sdata[threadIdx + blockDim] = 0.0;
 
   //Initialize Blocksum//
-  if(cache_id == 0) Blocksum[blockIdx.x] = 0.0;
-  bool Blockflag = false;
+  if(cache_id == 0)
+  {Blocksum[blockIdx] = 0.0; Blocksum[blockIdx + Nblock] = 0.0; }
  
-  if(total_ij < totalthreads)
-  {
-    size_t totalsize = 0;
-    const size_t NumberComp = 2; //Zhao's note: need to change here for multicomponent
     //Aij and Bij indicate the starting positions for the objects in the pairwise interaction//
-    size_t Aij   = 0; size_t Bij   = 0;
-    size_t MolA  = 0; size_t MolB  = 0;
-    size_t compA = 0; size_t compB = 0;
-    size_t NA    = 0; size_t NB    = 0;
-    if(total_ij < Host_threads) //This thread belongs to the Host_threads//
+  size_t AtomA = 0; size_t AtomB = 0;
+  size_t MolA  = 0; size_t MolB  = 0;
+  size_t compA = 0; size_t compB = 0;
+  double2 tempy = {0.0, 0.0};
+
+  size_t HH_Threads = HH_Nblock * blockDim;
+  size_t HG_Threads = HG_Nblock * blockDim;
+  //size_t GG_Threads = GG_Nblock * blockDim; //currently not used//
+
+    for(size_t i = 0; i != InteractionPerThread; i++)
     {
-      MolA = 0;
-      Aij  = total_ij / NAds * NFrameworkAtomsPerThread;
-      MolB = total_ij % NAds;
-      NA  = NFrameworkAtomsPerThread;
-      if(total_ij == Host_threads - 1) 
-        if(Host_threads % NFrameworkAtomsPerThread != 0)
-          NA = Host_threads % NFrameworkAtomsPerThread; 
-      if(!HostHost) compB = 1; //If we do not consider host-host, start with host-guest
-      //Here we need to determine the Molecule ID and which component the molecule belongs to//
-      
-      for(size_t ijk = compB; ijk < NumberComp; ijk++)
+      if(blockIdx < HH_Nblock)
       {
-        size_t Mol_ijk = System[ijk].size / System[ijk].Molsize;
-        totalsize     += Mol_ijk;
-        if(MolB >= totalsize)
+        size_t InteractionIdx = THREADIdx * InteractionPerThread + i;
+        if(ConsiderIntra) //All Framework atom vs. All Framework atom//
         {
-          compB++;
-          MolB -= Mol_ijk;
+          AtomA = NFrameworkAtoms - 2 - sycl::floor(sycl::sqrt(-8*(int) InteractionIdx + 4*NFrameworkAtoms*(NFrameworkAtoms-1)-7)/2.0 - 0.5);
+          AtomB = InteractionIdx + AtomA + 1 - NFrameworkAtoms*(NFrameworkAtoms-1)/2 + (NFrameworkAtoms-AtomA)*((NFrameworkAtoms-AtomA)-1)/2;
+        determine_comp_and_Atomindex_from_thread(System, AtomA, compA, 0, NComponents.y());
+        determine_comp_and_Atomindex_from_thread(System, AtomB, compB, 0, NComponents.y());
+        }
+        //If you have more than 1 framework components, then the following two conditions will always be there//
+        else 
+        {  
+          if(InteractionIdx < NFrameworkZero_ExtraFramework) //Framework comp 0 vs. other framework atoms//
+          {
+            AtomA  = InteractionIdx % System[0].size; //Framework Component 0 Atom//
+            AtomB  = InteractionIdx / System[0].size; //Framework Component >0 Atom//
+            determine_comp_and_Atomindex_from_thread(System, AtomA, compA, 0, NComponents.y());
+            determine_comp_and_Atomindex_from_thread(System, AtomB, compB, 1, NComponents.y());
+          }
+          else 
+          {
+            size_t NExtraFrameworkAtoms = NFrameworkAtoms - System[0].size;
+            size_t InteractionIdx = THREADIdx * InteractionPerThread + i - NFrameworkZero_ExtraFramework;
+            AtomA = NExtraFrameworkAtoms - 2 - sycl::floor(sycl::sqrt(-8*(int) InteractionIdx + 4*NExtraFrameworkAtoms*(NExtraFrameworkAtoms-1)-7)/2.0 - 0.5);
+            AtomB = InteractionIdx + AtomA + 1 - NExtraFrameworkAtoms*(NExtraFrameworkAtoms-1)/2 + (NExtraFrameworkAtoms-AtomA)*((NExtraFrameworkAtoms-AtomA)-1)/2;
+            determine_comp_and_Atomindex_from_thread(System, AtomA, compA, 1, NComponents.y());
+            determine_comp_and_Atomindex_from_thread(System, AtomB, compB, 1, NComponents.y());
+            //DEBUG//printf("THERE IS NExtraFrameworkAtoms x NExtraFrameworkAtoms INTERACTIONS, THREADIdx: %lu, blockIdx: %lu, threadIdx: %lu\n", THREADIdx, blockIdx, threadIdx);
+          }
         }
       }
-      NB = System[compB].Molsize;
-      Bij = MolB * NB;
+      else if(blockIdx < (HG_Nblock + HH_Nblock)) //Host-Guest//
+      {
+        //This thread belongs to the Host-Guest_threads//
+        size_t InteractionIdx = (THREADIdx - HH_Threads) * InteractionPerThread + i;
+        AtomA  = InteractionIdx / NAdsorbateAtoms; //Framework Atom//
+        AtomB  = InteractionIdx % NAdsorbateAtoms; //Adsorbate Atom//
+
+        determine_comp_and_Atomindex_from_thread(System, AtomA, compA, 0, NComponents.y());
+        determine_comp_and_Atomindex_from_thread(System, AtomB, compB, NComponents.y, NComponents.x());
+      }
+      else //Guest-Guest//
+      {
+        size_t InteractionIdx = (THREADIdx - HH_Threads - HG_Threads) * InteractionPerThread + i;
+        AtomA = NAdsorbateAtoms - 2 - sycl::floor(sycl::sqrt(-8*(int) InteractionIdx + 4*NAdsorbateAtoms*(NAdsorbateAtoms-1)-7)/2.0 - 0.5);
+        AtomB = InteractionIdx + AtomA + 1 - NAdsorbateAtoms*(NAdsorbateAtoms-1)/2 + (NAdsorbateAtoms-AtomA)*((NAdsorbateAtoms-AtomA)-1)/2;
+
+        determine_comp_and_Atomindex_from_thread(System, AtomA, compA, NComponents.y, NComponents.x());
+        determine_comp_and_Atomindex_from_thread(System, AtomB, compB, NComponents.y, NComponents.x());
+      }
+      MolA = System[compA].MolID[AtomA];
+      MolB = System[compB].MolID[AtomB];
+      if(AtomA >= System[compA].size || AtomB >= System[compB].size) continue;
+      if(!ConsiderIntra && (MolA == MolB) && (compA == compB)) continue;
+
+      const Atoms ComponentA = System[compA];
+      const Atoms ComponentB = System[compB];
+      VDWCoulEnergy_Total(Box, ComponentA, ComponentB, FF, flag, tempy, AtomA, AtomB, compA, compB, UseOffset);
     }
-    else //Adsorbate-Adsorbate//
-    { 
-      compA = 1; compB = 1;
-      size_t Ads_i = total_ij - Host_threads;
-      //https://stackoverflow.com/questions/27086195/linear-index-upper-triangular-matrix
-      MolA = NAds - 2 - std::floor(std::sqrt(-8*Ads_i + 4*NAds*(NAds-1)-7)/2.0 - 0.5);
-      MolB = Ads_i + MolA + 1 - NAds*(NAds-1)/2 + (NAds-MolA)*((NAds- MolA)-1)/2;
-      totalsize = 0;
-      //Determine the Molecule IDs and the component of MolA and MolB//
-      for(size_t ijk = 1; ijk < NumberComp; ijk++)
-      {
-        size_t Mol_ijk = System[ijk].size / System[ijk].Molsize;
-        totalsize     += Mol_ijk;
-        if(MolA >= totalsize)
-        {
-          compA++;
-          MolA -= Mol_ijk;
-        }
-      }
-      NA = System[compA].Molsize;
-      totalsize = 0;
-      for(size_t ijk = 1; ijk < NumberComp; ijk++)
-      {
-        size_t Mol_ijk = System[ijk].size / System[ijk].Molsize;
-        totalsize     += Mol_ijk;
-        if(MolB >= totalsize)
-        {
-          compB++;
-          MolB -= Mol_ijk;
-        }
-      }
-      NB = System[compB].Molsize;
-      Aij = MolA * NA; Bij = MolB * NB;
-    }
-    //printf("Thread: %lu, compA: %lu, compB: %lu, MolA: %lu, MolB: %lu, Aij: %lu, Bij: %lu, Molsizes: %lu %lu\n", total_ij, compA, compB, MolA, MolB, Aij, Bij, System[0].Molsize, System[1].Molsize);
 
-    sdata[ij_within_block] = 0.0;
-    //Initialize Blocksum//
-    if(cache_id == 0) Blocksum[blockIdx.x] = 0.0;
+  
+  sdata[threadIdx] = tempy.x(); 
+  sdata[threadIdx + blockDim] = tempy.y();
 
-    // Manually fusing/collapsing the loop //
-
-    const Atoms ComponentA=System[compA];
-    const Atoms ComponentB=System[compB];
-    double tempy = 0.0;
-    VDWCoulEnergy_Total(Box, ComponentA, ComponentB, Aij, Bij, FF, flag, Blockflag, tempy, NA, NB, UseOffset);
-    sdata[ij_within_block] = tempy;
-    //printf("ThreadID: %lu, HostThread: %lu, compA: %lu, compB: %lu, Aij: %lu, Bij: %lu, NA: %lu, NB: %lu, tempy: %.5f\n", total_ij, Host_threads, compA, compB, Aij, Bij, NA, NB, tempy);
-  }
-  __syncthreads();
+  item.barrier();
   //Partial block sum//
-  if(!Blockflag)
+  int reductionsize=blockDim / 2;
+  while(reductionsize != 0)
   {
-    int i=blockDim.x / 2;
-    while(i != 0) 
+    if(cache_id < reductionsize)
     {
-      if(cache_id < i) {sdata[cache_id] += sdata[cache_id + i];}
-      __syncthreads();
-      i /= 2;
+      sdata[cache_id] += sdata[cache_id + reductionsize];
+      sdata[cache_id + blockDim] += sdata[cache_id + reductionsize + blockDim];
     }
-    if(cache_id == 0) {Blocksum[blockIdx.x] = sdata[0];}
+    item.barrier();
+    reductionsize /= 2;
   }
-  else
-    flag[0] = true;
+  if(cache_id == 0)
+  {
+    Blocksum[blockIdx] = sdata[0];
+    Blocksum[blockIdx + Nblock] = sdata[blockDim];
+  }
+  
 }
-*/
+
 //Zhao's note: here the totMol does not consider framework atoms, ONLY Adsorbates//
-MoveEnergy Total_VDW_Coulomb_Energy(Simulations& Sim, ForceField FF, size_t totMol, size_t Host_threads, size_t Guest_threads, size_t NFrameworkAtomsPerThread, bool ConsiderHostHost, bool UseOffset)
+MoveEnergy Total_VDW_Coulomb_Energy(Simulations& Sim, Components& SystemComponents, ForceField FF, bool UseOffset)
+//MoveEnergy Total_VDW_Coulomb_Energy(Simulations& Sim, ForceField FF, size_t totMol, size_t Host_threads, size_t Guest_threads, size_t NFrameworkAtomsPerThread, bool ConsiderHostHost, bool UseOffset)
 {
+  // MoveEnergy E;
+  // if(Host_threads + Guest_threads == 0) return E;
+  // double VDWRealE = 0.0;
+  // size_t Nblock = 0; size_t Nthread = 0;
+  // Setup_threadblock(Host_threads + Guest_threads, &Nblock, &Nthread);
+  // if(Nblock > Sim.Nblocks)
+  // {
+  //   printf("More blocks for block sum is needed\n");
+  //   //cudaMalloc(&Sim.Blocksum, Nblock * sizeof(double));
+  // }
+
+  // //Calculate the energy of the new systems//
+  // //TotalVDWCoul<<<Nblock, Nthread, Nthread * sizeof(double)>>>(Sim.Box, Sim.d_a, FF, Sim.Blocksum, Sim.device_flag, Host_threads + Guest_threads, Host_threads, totMol, NFrameworkAtomsPerThread, ConsiderHostHost, UseOffset);
+  // //printf("Total VDW + Real, Nblock = %zu, Nthread = %zu, Host: %zu, Guest: %zu, Allocated size: %zu\n", Nblock, Nthread, Host_threads, Guest_threads, Sim.Nblocks);
+  // //Zhao's note: consider using the flag to check for overlap here//
+  // //printf("Total Thread: %zu, Nblock: %zu, Nthread: %zu\n", Host_threads + Guest_threads, Nblock, Nthread);
+  // //double BlockE[Nblock]; 
+  // //que.memcpy(BlockE, Sim.Blocksum, sizeof(double) * Nblock).wait();
+  // //for(size_t id = 0; id < Nblock; id++) E.GGVDW += BlockE[id];
+  // return E;
+
+
+
+
+
+  size_t NHostAtom = 0; size_t NGuestAtom = 0;
+  for(size_t i = 0; i < SystemComponents.NComponents.y(); i++)
+    NHostAtom += SystemComponents.Moleculesize[i] * SystemComponents.NumberOfMolecule_for_Component[i];
+  for(size_t i = SystemComponents.NComponents.y(); i < SystemComponents.NComponents.x(); i++)
+    NGuestAtom+= SystemComponents.Moleculesize[i] * SystemComponents.NumberOfMolecule_for_Component[i];
+
+  bool ConsiderIntra = false;
+  size_t HH_TotalThreads = 0; //if(ConsiderHostHost) HH_TotalThreads = NHostAtom * NHostAtom / 2;
+  size_t NFrameworkZero_ExtraFramework = 0;
+  if(ConsiderIntra) //Atom-Atom//
+  {
+    HH_TotalThreads = NHostAtom * (NHostAtom - 1) / 2;
+  }
+  else //if molecule-intra interactions are not considered, do component 0 x component 1-n_framework + component 1-n_framework x component 1-n_framework//
+  {
+    //printf("THERE IS MORE THAN 1 FRAMEWORK COMPONENTS\n");
+    size_t NFrameworkComponentZeroAtoms = SystemComponents.Moleculesize[0] * SystemComponents.NumberOfMolecule_for_Component[0];
+    size_t NExtraFrameworkAtoms = NHostAtom - NFrameworkComponentZeroAtoms;
+    NFrameworkZero_ExtraFramework = NFrameworkComponentZeroAtoms * NExtraFrameworkAtoms;
+    HH_TotalThreads = NFrameworkZero_ExtraFramework; //component 0 x component 1-n_framework
+    
+    HH_TotalThreads+= NExtraFrameworkAtoms * (NExtraFrameworkAtoms - 1) / 2; //component 1-n_framework x component 1-n_framework//
+    //printf("Framework Comp Zero Atoms: %zu, Other Comp Atoms: %zu\n", NFrameworkComponentZeroAtoms, NExtraFrameworkAtoms);
+    //printf("NFrameworkZero_ExtraFramework interactions: %zu, NExtraFrameworkAtoms * (NExtraFrameworkAtoms - 1) / 2: %zu\n", NFrameworkZero_ExtraFramework, NExtraFrameworkAtoms * (NExtraFrameworkAtoms - 1) / 2);
+  }
+
+  size_t HG_TotalThreads = NHostAtom * NGuestAtom; 
+  size_t GG_TotalThreads = NGuestAtom * (NGuestAtom - 1) / 2; //GG_TotalThreads =  * NGuestAtom / 2;
+  size_t InteractionPerThread = 100;
+
+  size_t HHThreadsNeeded = HH_TotalThreads / InteractionPerThread + (HH_TotalThreads % InteractionPerThread == 0 ? 0 : 1);
+  size_t HGThreadsNeeded = HG_TotalThreads / InteractionPerThread + (HG_TotalThreads % InteractionPerThread == 0 ? 0 : 1);
+  size_t GGThreadsNeeded = GG_TotalThreads / InteractionPerThread + (GG_TotalThreads % InteractionPerThread == 0 ? 0 : 1);
+
+  size_t HH_Nthread=0; size_t HH_Nblock=0; Setup_threadblock(HHThreadsNeeded, HH_Nblock, HH_Nthread);
+  size_t HG_Nthread=0; size_t HG_Nblock=0; Setup_threadblock(HGThreadsNeeded, HG_Nblock, HG_Nthread);
+  size_t GG_Nthread=0; size_t GG_Nblock=0; Setup_threadblock(GGThreadsNeeded, GG_Nblock, GG_Nthread);
   MoveEnergy E;
-  if(Host_threads + Guest_threads == 0) return E;
-  double VDWRealE = 0.0;
+  
+  if((HH_Nblock + HG_Nblock + GG_Nblock) == 0) return E;
   size_t Nblock = 0; size_t Nthread = 0;
-  Setup_threadblock(Host_threads + Guest_threads, &Nblock, &Nthread);
-  if(Nblock > Sim.Nblocks)
+  //Setup_threadblock(Host_threads + Guest_threads, Nblock, Nthread);
+  Nthread = std::max(GG_Nthread, HG_Nthread);
+  if(HH_Nthread > Nthread) Nthread = HH_Nthread;
+
+  if(Nblock*2 > Sim.Nblocks)
   {
     printf("More blocks for block sum is needed\n");
-    //cudaMalloc(&Sim.Blocksum, Nblock * sizeof(double));
+    cudaMalloc(&Sim.Blocksum, 2*Nblock * sizeof(double));
+    Sim.BlockSum = sycl::malloc<double>(2*Nblock, que);
   }
 
+  int3 BLOCKS = {HH_Nblock, HG_Nblock, GG_Nblock};
+
   //Calculate the energy of the new systems//
-  //TotalVDWCoul<<<Nblock, Nthread, Nthread * sizeof(double)>>>(Sim.Box, Sim.d_a, FF, Sim.Blocksum, Sim.device_flag, Host_threads + Guest_threads, Host_threads, totMol, NFrameworkAtomsPerThread, ConsiderHostHost, UseOffset);
+  //Host-Guest + Guest-Guest//
+  Nblock = HH_Nblock + HG_Nblock + GG_Nblock;
+  //printf("Atoms: %zu %zu\n", NHostAtom, NGuestAtom);
+  //printf("Interactions: %zu %zu %zu\n", HH_TotalThreads, HG_TotalThreads, GG_TotalThreads);
+  //printf("Nblock %zu, blocks: %zu %zu %zu, threads needed: %zu %zu %zu, Nthread: %zu\n", Nblock, HH_Nblock, HG_Nblock, GG_Nblock, HHThreadsNeeded, HGThreadsNeeded, GGThreadsNeeded, Nthread);
+
+  //Set Overlap Flag//
+  que.memset(Sim.device_flag, false, sizeof(bool));
+ 
+  que.submit([&](sycl::handler &cgh) {
+    sycl::local_accessor<double, 1> local_mem(sycl::range<1>(2 * Nthread), cgh);
+      
+    cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(Nblock * Nthread, Nthread)), [=](sycl::nd_item<1> item) {
+      TotalVDWRealCoulomb(Sim.Box, Sim.d_a, FF, Sim.Blocksum, Sim.device_flag, InteractionPerThread, UseOffset, BLOCKS, SystemComponents.NComponents, NHostAtom, NGuestAtom, NFrameworkZero_ExtraFramework, ConsiderIntra, item, local_mem.get_multi_ptr<sycl::access::decorated::yes>());
+    });
+  });
+  
+  que.wait();
+
   //printf("Total VDW + Real, Nblock = %zu, Nthread = %zu, Host: %zu, Guest: %zu, Allocated size: %zu\n", Nblock, Nthread, Host_threads, Guest_threads, Sim.Nblocks);
   //Zhao's note: consider using the flag to check for overlap here//
   //printf("Total Thread: %zu, Nblock: %zu, Nthread: %zu\n", Host_threads + Guest_threads, Nblock, Nthread);
-  //double BlockE[Nblock]; 
-  //que.memcpy(BlockE, Sim.Blocksum, sizeof(double) * Nblock).wait();
-  //for(size_t id = 0; id < Nblock; id++) E.GGVDW += BlockE[id];
-  return E;
-}
+  double BlockE[Nblock*2];
+  que.memcpy(BlockE, Sim.Blocksum, Nblock*2 * sizeof(double)).wait();
 
+  for(size_t id = 0; id < HH_Nblock; id++) E.HHVDW += BlockE[id];
+  for(size_t id = HH_Nblock; id < HH_Nblock + HG_Nblock; id++) E.HGVDW += BlockE[id];
+  for(size_t id = HH_Nblock + HG_Nblock; id < Nblock; id++) E.GGVDW += BlockE[id];
 
-void REZERO_VALS(double* vals, size_t size)
-{
-  for(size_t i = 0; i < size; i++) vals[i] = 0.0;
+  for(size_t id = Nblock; id < Nblock + HH_Nblock; id++) E.HHReal += BlockE[id];
+  for(size_t id = Nblock + HH_Nblock; id < Nblock + HH_Nblock + HG_Nblock; id++) E.HGReal += BlockE[id];
+  for(size_t id = Nblock + HH_Nblock + HG_Nblock; id < Nblock+Nblock; id++) E.GGReal += BlockE[id];
+  //printf("GPU VDW REAL ENERGY:\n"); E.print();
+
+  return E;  
 }

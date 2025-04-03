@@ -76,8 +76,6 @@ extern SYCL_EXTERNAL __attribute__((always_inline)) void Calculate_Single_Body_E
 
 extern SYCL_EXTERNAL __attribute__((always_inline)) void Calculate_Multiple_Trial_Energy_SEPARATE_HostGuest_VDWReal(Boxsize Box, Atoms* System, Atoms NewMol, ForceField FF, double* Blocksum, size_t ComponentID, size_t totalAtoms, bool* flag, size_t totalthreads, size_t chainsize, size_t NblockForTrial, size_t HG_Nblock, int3 NComps, int2* ExcludeList, const sycl::nd_item<1> &item, sycl::decorated_local_ptr<double> dpct_local);
 
-__attribute__((always_inline)) void REZERO_VALS(double* vals, size_t size);
-
 __attribute__((always_inline)) void Energy_difference_LambdaChange(Boxsize Box, Atoms *System, Atoms Mol,
                                     ForceField FF, double *BlockEnergy,
                                     size_t ComponentID, size_t totalAtoms,
@@ -102,16 +100,16 @@ double GPU_EwaldDifference_IdentitySwap(
     double *Blocksum, Components &SystemComponents, size_t OLDComponent,
     size_t NEWComponent, size_t UpdateLocation);
 
-void Update_Ewald_Vector(Boxsize& Box, bool CPU, Components& SystemComponents);
+void Update_Vector_Ewald(Boxsize& Box, bool CPU, Components& SystemComponents);
 
-double GPU_EwaldDifference_General(Boxsize &Box, Atoms *&d_a, Atoms &New,
+double2 GPU_EwaldDifference_General(Boxsize &Box, Atoms *&d_a, Atoms &New,
                                    Atoms &Old, ForceField &FF, double *Blocksum,
                                    Components &SystemComponents,
                                    size_t SelectedComponent, int MoveType,
                                    size_t Location,
                                    double2 proposed_scale);
 
-double GPU_EwaldDifference_LambdaChange(Boxsize &Box, Atoms *&d_a, Atoms &Old,
+double2 GPU_EwaldDifference_LambdaChange(Boxsize &Box, Atoms *&d_a, Atoms &Old,
                                         ForceField &FF, double *Blocksum,
                                         Components &SystemComponents,
                                         size_t SelectedComponent,
@@ -120,19 +118,19 @@ double GPU_EwaldDifference_LambdaChange(Boxsize &Box, Atoms *&d_a, Atoms &Old,
 
 void Skip_Ewald(Boxsize& Box);
 
-void TotalVDWCoul(Boxsize Box, Atoms* System, ForceField FF, double* Blocksum, bool* flag, size_t totalthreads, size_t Host_threads, size_t NAds, size_t NFrameworkAtomsPerThread, bool HostHost, bool UseOffset);
+__attribute__((always_inline)) void TotalVDWCoul(Boxsize Box, Atoms* System, ForceField FF, double* Blocksum, bool* flag, size_t totalthreads, size_t Host_threads, size_t NAds, size_t NFrameworkAtomsPerThread, bool HostHost, bool UseOffset);
 
 void Setup_threadblock_EW(size_t arraysize, size_t *Nblock, size_t *Nthread);
 
-void Double3_CacheCheck(double* Array, Complex* Vector, size_t totsize);
+__attribute__((always_inline)) void Double3_CacheCheck(double* Array, Complex* Vector, size_t totsize);
 
-void Setup_Ewald_Vector(Boxsize Box, Complex* eik_x, Complex* eik_y, Complex* eik_z, Atoms* System, size_t numberOfAtoms, size_t NumberOfComponents, bool UseOffSet);
+__attribute__((always_inline)) void Setup_Ewald_Vector(Boxsize Box, Complex* eik_x, Complex* eik_y, Complex* eik_z, Atoms* System, size_t numberOfAtoms, size_t NumberOfComponents, bool UseOffSet);
 
 void CPU_GPU_EwaldTotalEnergy(Boxsize& Box, Boxsize& device_Box, Atoms* System, Atoms* d_a, ForceField FF, ForceField device_FF, Components& SystemComponents, MoveEnergy& E);
 
 void Calculate_Exclusion_Energy_Rigid(Boxsize& Box, Atoms* System, ForceField FF, Components& SystemComponents);
 
-void Check_WaveVector_CPUGPU(Boxsize& Box, Components& SystemComponents);
+void Check_StructureFactor_CPUGPU(Boxsize& Box, Components& SystemComponents);
 
 ////////////////////
 // Total energies //
@@ -140,7 +138,8 @@ void Check_WaveVector_CPUGPU(Boxsize& Box, Components& SystemComponents);
 
 MoveEnergy Ewald_TotalEnergy(Simulations& Sim, Components& SystemComponents, bool UseOffSet);
 
-MoveEnergy Total_VDW_Coulomb_Energy(Simulations& Sim, ForceField FF, size_t totMol, size_t Host_threads, size_t Guest_threads, size_t NFrameworkAtomsPerThread, bool ConsiderHostHost, bool UseOffset);
+MoveEnergy Total_VDW_Coulomb_Energy(Simulations& Sim, Components& SystemComponents, ForceField FF, bool UseOffset);
+//MoveEnergy Total_VDW_Coulomb_Energy(Simulations& Sim, ForceField device_FF, size_t totMol, size_t Host_threads, size_t Guest_threads, size_t NFrameworkAtomsPerThread, bool ConsiderHostHost, bool UseOffset);
 
 //////////////////////
 // Tail Corrections //

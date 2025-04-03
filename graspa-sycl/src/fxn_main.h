@@ -196,16 +196,12 @@ inline void Initialize_Move_Statistics(Move_Statistics &MoveStats) {
 inline void Setup_Box_Temperature_Pressure(Units &Constants,
                                            Components &SystemComponents,
                                            Boxsize &device_Box) {
-  SystemComponents.Beta =
-      1.0 / (Constants.BoltzmannConstant /
-             (Constants.MassUnit * pow(Constants.LengthUnit, 2) /
-              pow(Constants.TimeUnit, 2)) *
-             SystemComponents.Temperature);
-  // Convert pressure from pascal
-  device_Box.Pressure /= (Constants.MassUnit /
-                          (Constants.LengthUnit * pow(Constants.TimeUnit, 2)));
+  SystemComponents.Beta = 1.0/(Constants.BoltzmannConstant/(Constants.MassUnit*pow(Constants.LengthUnit,2)/pow(Constants.TimeUnit,2))*SystemComponents.Temperature);
+  //Convert pressure from pascal
+  SystemComponents.Pressure_Pa = SystemComponents.Pressure;
+  SystemComponents.Pressure/=(Constants.MassUnit/(Constants.LengthUnit*pow(Constants.TimeUnit,2)));
   printf("------------------- SIMULATION BOX PARAMETERS -----------------\n");
-  printf("Pressure:        %.5f\n", device_Box.Pressure);
+  printf("Pressure:        %.5f\n", SystemComponents.Pressure);
   printf("Box Volume:      %.5f\n", device_Box.Volume);
   printf("Box Beta:        %.5f\n", SystemComponents.Beta);
   printf("Box Temperature: %.5f\n", SystemComponents.Temperature);
@@ -371,145 +367,277 @@ inline void Allocate_Copy_Ewald_Vector(Boxsize &device_Box,
       "****** DONE Allocating Ewald WaveVectors (INITIAL STAGE ONLY) ******\n");
 }
 
-inline void Check_Simulation_Energy(Boxsize &Box, Atoms *System, ForceField FF,
-                                    ForceField device_FF,
-                                    Components &SystemComponents,
-                                    int SIMULATIONSTAGE, size_t Numsim,
-                                    Simulations &Sim) {
+
+
+// ABB: this is the version from CUDA
+inline void Check_Simulation_Energy(Boxsize& Box, Atoms* System, ForceField FF, ForceField device_FF, Components& SystemComponents, int SIMULATIONSTAGE, size_t Numsim, Simulations& Sim, bool UseGPU)
+{
   sycl::queue &que = *sycl_get_queue();
-  std::string STAGE;
-  switch (SIMULATIONSTAGE) {
-  case INITIAL: {
-    STAGE = "INITIAL";
-    break;
+  
+  std::string STAGE; 
+  switch(SIMULATIONSTAGE)
+  {
+    case INITIAL:
+    { STAGE = "INITIAL"; break;}
+    case CREATEMOL:
+    { STAGE = "CREATE_MOLECULE"; break;}
+    case FINAL:
+    { STAGE = "FINAL"; break;}
   }
-  case CREATEMOL: {
-    STAGE = "CREATE_MOLECULE";
-    break;
-  }
-  case FINAL: {
-    STAGE = "FINAL";
-    break;
-  }
-  }
-  printf("======================== CALCULATING %s STAGE ENERGY "
-         "========================\n",
-         STAGE.c_str());
+  printf("======================== CALCULATING %s STAGE ENERGY ========================\n", STAGE.c_str());
   MoveEnergy ENERGY;
-  Atoms device_System[SystemComponents.Total_Components];
-  que.memcpy(device_System, Sim.d_a,
-             SystemComponents.Total_Components * sizeof(Atoms))
-      .wait();
+
+  Atoms device_System[SystemComponents.NComponents.x()];
+  que.memcpy(device_System, Sim.d_a, SystemComponents.NComponents.x() * sizeof(Atoms)).wait();
   que.memcpy(Box.Cell, Sim.Box.Cell, 9 * sizeof(double)).wait();
   que.memcpy(Box.InverseCell, Sim.Box.InverseCell, 9 * sizeof(double)).wait();
-  // Update every value that can be changed during a volume move//
+  //Update every value that can be changed during a volume move//
   Box.Volume = Sim.Box.Volume;
   Box.ReciprocalCutOff = Sim.Box.ReciprocalCutOff;
   Box.Cubic = Sim.Box.Cubic;
-  Box.kmax = Sim.Box.kmax;
-
-  MoveEnergy GPU_Energy;
+  Box.kmax  = Sim.Box.kmax;
 
   double start = omp_get_wtime();
   VDWReal_Total_CPU(Box, System, device_System, FF, SystemComponents, ENERGY);
-  ENERGY.print();
   double end = omp_get_wtime();
   double CPUSerialTime = end - start;
   start = omp_get_wtime();
-  double *xxx;
-  xxx = (double *)malloc(sizeof(double) * 2);
-  double *device_xxx;
-  device_xxx = CUDA_copy_allocate_array(xxx, 2);
-  // Zhao's note: if the serial GPU energy test is too slow, comment it out//
-  // one_thread_GPU_test<<<1,1>>>(Sim.Box, Sim.d_a, device_FF, device_xxx);
-  que.memcpy(xxx, device_xxx, sizeof(double)).wait();
-  end = omp_get_wtime();
-  que.wait();
 
-  double SerialGPUTime = end - start;
-  // For total energy, divide the parallelization into several parts//
-  // For framework, every thread treats the interaction between one framework
-  // atom with an adsorbate molecule// For adsorbate/adsorbate, every thread
-  // treats one adsorbate molecule with an adsorbate molecule//
-  start = omp_get_wtime();
-  size_t Host_threads = 0;
-  size_t Guest_threads = 0;
-  size_t NFrameworkAtomsPerThread = 4;
-  size_t NAdsorbate = 0;
-  for (size_t i = 1; i < SystemComponents.Total_Components; i++)
-    NAdsorbate += SystemComponents.NumberOfMolecule_for_Component[i];
-  Host_threads = SystemComponents.Moleculesize[0] /
-                 NFrameworkAtomsPerThread; // Per adsorbate molecule//
-  if (SystemComponents.Moleculesize[0] % NFrameworkAtomsPerThread != 0)
-    Host_threads++;
-  Host_threads *= NAdsorbate; // Total = Host_thread_per_molecule * number of
-                              // Adsorbate molecule
-  Guest_threads = NAdsorbate * (NAdsorbate - 1) / 2;
-  if (Host_threads + Guest_threads > 0) {
-    bool ConsiderHostHost = false;
-    bool UseOffset = false;
-    GPU_Energy += Total_VDW_Coulomb_Energy(
-        Sim, device_FF, NAdsorbate, Host_threads, Guest_threads,
-        NFrameworkAtomsPerThread, ConsiderHostHost, UseOffset);
-  }
-  end = omp_get_wtime();
 
-  // Do Parallel Total Ewald//
-  double TotEwald = 0.0;
-  double CPUEwaldTime = 0.0;
-  double GPUEwaldTime = 0.0;
-
-  if (!device_FF.noCharges) {
-    que.wait();
+  if(!device_FF.noCharges)
+  {
     double EwStart = omp_get_wtime();
-
-    CPU_GPU_EwaldTotalEnergy(Box, Sim.Box, System, Sim.d_a, FF, device_FF,
-                             SystemComponents, ENERGY);
-    ENERGY.EwaldE -= SystemComponents.FrameworkEwald;
-
-    double EwEnd = omp_get_wtime();
-    // Zhao's note: if it is in the initial stage, calculate the intra and self
-    // exclusion energy for ewald summation//
-    if (SIMULATIONSTAGE == INITIAL)
-      Calculate_Exclusion_Energy_Rigid(Box, System, FF, SystemComponents);
-    CPUEwaldTime = EwEnd - EwStart;
+    CPU_GPU_EwaldTotalEnergy(Box, Sim.Box, System, Sim.d_a, FF, device_FF, SystemComponents, ENERGY);
+    ENERGY.GGEwaldE -= SystemComponents.FrameworkEwald;
+    //Zhao's note: since many times the framework is held rigid (or has a large part rigid), for convenience (and for not confusing people), Host-Host Ewald E automatically ignores the initial value//
+    //This is be mentioned when reporting the total energy of the system//
+    //Record the initial framework ewald at the begining, then minus it from the HHEwaldE after that//
+    if(SIMULATIONSTAGE == INITIAL)
+    {
+      SystemComponents.InitialFrameworkEwald = ENERGY.HHEwaldE;
+    }
+    ENERGY.HHEwaldE -= SystemComponents.InitialFrameworkEwald;
+    double EwEnd  = omp_get_wtime();
+    printf("Ewald Summation (total energy) on the CPU took %.5f secs\n", EwEnd - EwStart);
+    //Zhao's note: if it is in the initial stage, calculate the intra and self exclusion energy for ewald summation//
+    if(SIMULATIONSTAGE == INITIAL) Calculate_Exclusion_Energy_Rigid(Box, System, FF, SystemComponents);
 
     que.wait();
-    // Zhao's note: if doing initial energy, initialize and copy host Ewald to
-    // device//
-    if (SIMULATIONSTAGE == INITIAL)
-      Allocate_Copy_Ewald_Vector(Sim.Box, SystemComponents);
-    Check_WaveVector_CPUGPU(
-        Sim.Box, SystemComponents); // Check WaveVector on the CPU and GPU//
+    //Zhao's note: if doing initial energy, initialize and copy host Ewald to device// 
+    if(SIMULATIONSTAGE == INITIAL) Allocate_Copy_Ewald_Vector(Sim.Box, SystemComponents);
+    Check_StructureFactor_CPUGPU(Sim.Box, SystemComponents); //Check StructureFactor on the CPU and GPU//
     que.wait();
-    EwStart = omp_get_wtime();
-    bool UseOffset = false;
-    // GPU_Energy  += Ewald_TotalEnergy(Sim, SystemComponents, UseOffset);
-    GPU_Energy.EwaldE -= SystemComponents.FrameworkEwald;
-    que.wait();
-    EwEnd = omp_get_wtime();
-    GPUEwaldTime = EwEnd - EwStart;
   }
+  //Calculate Tail Correction Energy//
+  //This is only on CPU, not GPU//
+  ENERGY.TailE     = TotalTailCorrection(SystemComponents, FF.size, Sim.Box.Volume);
 
-  // Calculate Tail Correction Energy//
-  ENERGY.TailE = TotalTailCorrection(SystemComponents, FF.size, Sim.Box.Volume);
-
-  // ENERGY.DNN_E = Predict_From_FeatureMatrix_Total(Sim, SystemComponents);
-
-  if (SystemComponents.UseDNNforHostGuest)
+  //This energy uses GPU, but lets copy it as well, no need to compute 2times//
+  if(SystemComponents.UseDNNforHostGuest) 
+  {
+    // ABB: This needs to be enabled to have same implementation as CUDA 
+    // ENERGY.DNN_E     = DNN_Prediction_Total(SystemComponents, Sim);
+    // ENERGY.DNN_Replace_Energy();
     double Correction = ENERGY.DNN_Correction();
-
-  if (SIMULATIONSTAGE == INITIAL)
-    SystemComponents.Initial_Energy = ENERGY;
-  else if (SIMULATIONSTAGE == CREATEMOL) {
+  }
+ 
+  if(SIMULATIONSTAGE == INITIAL) SystemComponents.Initial_Energy = ENERGY;
+  else if(SIMULATIONSTAGE == CREATEMOL)
+  {
     SystemComponents.CreateMol_Energy = ENERGY;
-  } else {
+  }
+  else
+  { 
     SystemComponents.Final_Energy = ENERGY;
   }
-  printf("====================== DONE CALCULATING %s STAGE ENERGY "
-         "======================\n",
-         STAGE.c_str());
+
+  if(UseGPU)
+  {
+    MoveEnergy GPU_Energy;
+    bool   UseOffset = false;
+    double start = omp_get_wtime();
+    GPU_Energy += Total_VDW_Coulomb_Energy(Sim, SystemComponents, device_FF, UseOffset);
+    que.wait();
+    double end = omp_get_wtime();
+    printf("VDW + Real on the GPU took %.5f secs\n", end - start);
+
+    /*
+    //SINGLE-THREAD GPU VDW + Real, use just for debugging!!!//
+    double* xxx; xxx = (double*) malloc(sizeof(double)*2);
+    double* device_xxx; device_xxx = CUDA_copy_allocate_array(xxx, 2);
+    //Zhao's note: if the serial GPU energy test is too slow, comment it out//
+    //one_thread_GPU_test<<<1,1>>>(Sim.Box, Sim.d_a, device_FF, device_xxx);
+    cudaMemcpy(xxx, device_xxx, sizeof(double), cudaMemcpyDeviceToHost);
+           end = omp_get_wtime();
+    cudaDeviceSynchronize();
+    */
+
+    if(!device_FF.noCharges)
+    {
+      start = omp_get_wtime();
+      GPU_Energy  += Ewald_TotalEnergy(Sim, SystemComponents, UseOffset);
+      GPU_Energy.HHEwaldE -= SystemComponents.InitialFrameworkEwald;
+      end = omp_get_wtime();
+      double GPUEwaldTime = end - start;
+      printf("Ewald Summation (total energy) on the GPU took %.5f secs\n", GPUEwaldTime);
+    }
+    GPU_Energy.TailE = TotalTailCorrection(SystemComponents, FF.size, Sim.Box.Volume);
+
+    if(SystemComponents.UseDNNforHostGuest)
+    {
+      GPU_Energy.DNN_E = ENERGY.DNN_E;
+      GPU_Energy.DNN_Replace_Energy();
+      double GPU_Correction = GPU_Energy.DNN_Correction();
+    }
+
+    printf("Total GPU Energy: \n"); GPU_Energy.print();
+    if(SIMULATIONSTAGE == FINAL) SystemComponents.GPU_Energy = GPU_Energy;
+  }
+
+  printf("====================== DONE CALCULATING %s STAGE ENERGY ======================\n", STAGE.c_str());
 }
+
+
+// // ABB: this is old version
+// inline void Check_Simulation_Energy(Boxsize &Box, Atoms *System, ForceField FF,
+//                                     ForceField device_FF,
+//                                     Components &SystemComponents,
+//                                     int SIMULATIONSTAGE, size_t Numsim,
+//                                     Simulations &Sim) {
+//   sycl::queue &que = *sycl_get_queue();
+//   std::string STAGE;
+//   switch (SIMULATIONSTAGE) {
+//   case INITIAL: {
+//     STAGE = "INITIAL";
+//     break;
+//   }
+//   case CREATEMOL: {
+//     STAGE = "CREATE_MOLECULE";
+//     break;
+//   }
+//   case FINAL: {
+//     STAGE = "FINAL";
+//     break;
+//   }
+//   }
+//   printf("======================== CALCULATING %s STAGE ENERGY "
+//          "========================\n",
+//          STAGE.c_str());
+//   MoveEnergy ENERGY;
+//   Atoms device_System[SystemComponents.Total_Components];
+//   que.memcpy(device_System, Sim.d_a,
+//              SystemComponents.Total_Components * sizeof(Atoms))
+//       .wait();
+//   que.memcpy(Box.Cell, Sim.Box.Cell, 9 * sizeof(double)).wait();
+//   que.memcpy(Box.InverseCell, Sim.Box.InverseCell, 9 * sizeof(double)).wait();
+//   // Update every value that can be changed during a volume move//
+//   Box.Volume = Sim.Box.Volume;
+//   Box.ReciprocalCutOff = Sim.Box.ReciprocalCutOff;
+//   Box.Cubic = Sim.Box.Cubic;
+//   Box.kmax = Sim.Box.kmax;
+
+//   MoveEnergy GPU_Energy;
+
+//   double start = omp_get_wtime();
+//   VDWReal_Total_CPU(Box, System, device_System, FF, SystemComponents, ENERGY);
+//   ENERGY.print();
+//   double end = omp_get_wtime();
+//   double CPUSerialTime = end - start;
+//   start = omp_get_wtime();
+//   double *xxx;
+//   xxx = (double *)malloc(sizeof(double) * 2);
+//   double *device_xxx;
+//   device_xxx = CUDA_copy_allocate_array(xxx, 2);
+//   // Zhao's note: if the serial GPU energy test is too slow, comment it out//
+//   // one_thread_GPU_test<<<1,1>>>(Sim.Box, Sim.d_a, device_FF, device_xxx);
+//   que.memcpy(xxx, device_xxx, sizeof(double)).wait();
+//   end = omp_get_wtime();
+//   que.wait();
+
+//   double SerialGPUTime = end - start;
+//   // For total energy, divide the parallelization into several parts//
+//   // For framework, every thread treats the interaction between one framework
+//   // atom with an adsorbate molecule// For adsorbate/adsorbate, every thread
+//   // treats one adsorbate molecule with an adsorbate molecule//
+//   start = omp_get_wtime();
+//   size_t Host_threads = 0;
+//   size_t Guest_threads = 0;
+//   size_t NFrameworkAtomsPerThread = 4;
+//   size_t NAdsorbate = 0;
+//   for (size_t i = 1; i < SystemComponents.Total_Components; i++)
+//     NAdsorbate += SystemComponents.NumberOfMolecule_for_Component[i];
+//   Host_threads = SystemComponents.Moleculesize[0] /
+//                  NFrameworkAtomsPerThread; // Per adsorbate molecule//
+//   if (SystemComponents.Moleculesize[0] % NFrameworkAtomsPerThread != 0)
+//     Host_threads++;
+//   Host_threads *= NAdsorbate; // Total = Host_thread_per_molecule * number of
+//                               // Adsorbate molecule
+//   Guest_threads = NAdsorbate * (NAdsorbate - 1) / 2;
+//   if (Host_threads + Guest_threads > 0) {
+//     bool ConsiderHostHost = false;
+//     bool UseOffset = false;
+//     GPU_Energy += Total_VDW_Coulomb_Energy(
+//         Sim, device_FF, NAdsorbate, Host_threads, Guest_threads,
+//         NFrameworkAtomsPerThread, ConsiderHostHost, UseOffset);
+//   }
+//   end = omp_get_wtime();
+
+//   // Do Parallel Total Ewald//
+//   double TotEwald = 0.0;
+//   double CPUEwaldTime = 0.0;
+//   double GPUEwaldTime = 0.0;
+
+//   if (!device_FF.noCharges) {
+//     que.wait();
+//     double EwStart = omp_get_wtime();
+
+//     CPU_GPU_EwaldTotalEnergy(Box, Sim.Box, System, Sim.d_a, FF, device_FF,
+//                              SystemComponents, ENERGY);
+//     ENERGY.EwaldE -= SystemComponents.FrameworkEwald;
+
+//     double EwEnd = omp_get_wtime();
+//     // Zhao's note: if it is in the initial stage, calculate the intra and self
+//     // exclusion energy for ewald summation//
+//     if (SIMULATIONSTAGE == INITIAL)
+//       Calculate_Exclusion_Energy_Rigid(Box, System, FF, SystemComponents);
+//     CPUEwaldTime = EwEnd - EwStart;
+
+//     que.wait();
+//     // Zhao's note: if doing initial energy, initialize and copy host Ewald to
+//     // device//
+//     if (SIMULATIONSTAGE == INITIAL)
+//       Allocate_Copy_Ewald_Vector(Sim.Box, SystemComponents);
+//     Check_WaveVector_CPUGPU(
+//         Sim.Box, SystemComponents); // Check WaveVector on the CPU and GPU//
+//     que.wait();
+//     EwStart = omp_get_wtime();
+//     bool UseOffset = false;
+//     // GPU_Energy  += Ewald_TotalEnergy(Sim, SystemComponents, UseOffset);
+//     GPU_Energy.EwaldE -= SystemComponents.FrameworkEwald;
+//     que.wait();
+//     EwEnd = omp_get_wtime();
+//     GPUEwaldTime = EwEnd - EwStart;
+//   }
+
+//   // Calculate Tail Correction Energy//
+//   ENERGY.TailE = TotalTailCorrection(SystemComponents, FF.size, Sim.Box.Volume);
+
+//   // ENERGY.DNN_E = Predict_From_FeatureMatrix_Total(Sim, SystemComponents);
+
+//   if (SystemComponents.UseDNNforHostGuest)
+//     double Correction = ENERGY.DNN_Correction();
+
+//   if (SIMULATIONSTAGE == INITIAL)
+//     SystemComponents.Initial_Energy = ENERGY;
+//   else if (SIMULATIONSTAGE == CREATEMOL) {
+//     SystemComponents.CreateMol_Energy = ENERGY;
+//   } else {
+//     SystemComponents.Final_Energy = ENERGY;
+//   }
+//   printf("====================== DONE CALCULATING %s STAGE ENERGY "
+//          "======================\n",
+//          STAGE.c_str());
+// }
 
 inline void Copy_AtomData_from_Device(Atoms *System, Atoms *Host_System,
                                       Atoms *d_a,
@@ -562,90 +690,53 @@ inline void Copy_AtomData_from_Device(Atoms *System, Atoms *Host_System,
 inline void PRINT_ENERGY_AT_STAGE(Components &SystemComponents, int stage,
                                   Units &Constants) {
   std::string stage_name;
-  MoveEnergy E;
-  switch (stage) {
-  case INITIAL: {
-    stage_name = "INITIAL STAGE";
-    E = SystemComponents.Initial_Energy;
-    break;
-  }
-  case CREATEMOL: {
-    stage_name = "CREATE MOLECULE STAGE";
-    E = SystemComponents.CreateMol_Energy;
-    break;
-  }
-  case FINAL: {
-    stage_name = "FINAL STAGE";
-    E = SystemComponents.Final_Energy;
-    break;
-  }
-  case CREATEMOL_DELTA: {
-    stage_name = "RUNNING DELTA_E (CREATE MOLECULE - INITIAL)";
-    E = SystemComponents.CreateMoldeltaE;
-    break;
-  }
-  case DELTA: {
-    stage_name = "RUNNING DELTA_E (FINAL - CREATE MOLECULE)";
-    E = SystemComponents.deltaE;
-    break;
-  }
-  case CREATEMOL_DELTA_CHECK: {
-    stage_name = "CHECK DELTA_E (CREATE MOLECULE - INITIAL)";
-    E = SystemComponents.CreateMol_Energy - SystemComponents.Initial_Energy;
-    break;
-  }
-  case DELTA_CHECK: {
-    stage_name = "CHECK DELTA_E (FINAL - CREATE MOLECULE)";
-    E = SystemComponents.Final_Energy - SystemComponents.CreateMol_Energy;
-    break;
-  }
-  case DRIFT: {
-    stage_name = "ENERGY DRIFT";
-    E = SystemComponents.CreateMol_Energy + SystemComponents.deltaE -
-        SystemComponents.Final_Energy;
-    break;
-  }
-  }
+  MoveEnergy  E;
+  switch(stage)
+    {
+    case INITIAL:               {stage_name = "INITIAL STAGE";         E = SystemComponents.Initial_Energy;   break;}
+    case CREATEMOL:             {stage_name = "CREATE MOLECULE STAGE"; E = SystemComponents.CreateMol_Energy; break;}
+    case FINAL:                 {stage_name = "FINAL STAGE";           E = SystemComponents.Final_Energy;     break;}
+    case CREATEMOL_DELTA:       {stage_name = "RUNNING DELTA_E (CREATE MOLECULE - INITIAL)"; E = SystemComponents.CreateMoldeltaE; break;}
+    case DELTA:                 {stage_name = "RUNNING DELTA_E (FINAL - CREATE MOLECULE)";   E = SystemComponents.deltaE; break;}
+    case CREATEMOL_DELTA_CHECK: {stage_name = "CHECK DELTA_E (CREATE MOLECULE - INITIAL)"; E = SystemComponents.CreateMol_Energy - SystemComponents.Initial_Energy; break;}
+    case DELTA_CHECK: {stage_name = "CHECK DELTA_E (RUNNING FINAL - CREATE MOLECULE)"; E = SystemComponents.Final_Energy - SystemComponents.CreateMol_Energy; break;}
+    case DRIFT: {stage_name = "ENERGY DRIFT (CPU FINAL - RUNNING FINAL)"; E = SystemComponents.CreateMol_Energy + SystemComponents.deltaE - SystemComponents.Final_Energy; break;}
+    case GPU_DRIFT: {stage_name = "GPU DRIFT (GPU FINAL - CPU FINAL)"; E = SystemComponents.Final_Energy - SystemComponents.GPU_Energy; break;}
+    case AVERAGE: {stage_name = "PRODUCTION PHASE AVERAGE ENERGY"; E = SystemComponents.AverageEnergy + SystemComponents.Initial_Energy;break;}
+    case AVERAGE_ERR: {stage_name = "PRODUCTION PHASE AVERAGE ENERGY ERRORBAR"; E = SystemComponents.AverageEnergy_Errorbar; break;}
+    }
   printf(" *** %s *** \n", stage_name.c_str());
-  printf("====================================================================="
-         "===\n");
-  printf("VDW [Host-Guest]:           %.5f (%.5f [K])\n", E.HGVDW,
-         E.HGVDW * Constants.energy_to_kelvin);
-  printf("VDW [Guest-Guest]:          %.5f (%.5f [K])\n", E.GGVDW,
-         E.GGVDW * Constants.energy_to_kelvin);
-  printf("Real Coulomb [Host-Guest]:  %.5f (%.5f [K])\n", E.HGReal,
-         E.HGReal * Constants.energy_to_kelvin);
-  printf("Real Coulomb [Guest-Guest]: %.5f (%.5f [K])\n", E.GGReal,
-         E.GGReal * Constants.energy_to_kelvin);
-  printf("Ewald [Host-Guest]:         %.5f (%.5f [K])\n", E.HGEwaldE,
-         E.HGEwaldE * Constants.energy_to_kelvin);
-  printf("Ewald [Guest-Guest]:        %.5f (%.5f [K])\n", E.EwaldE,
-         E.EwaldE * Constants.energy_to_kelvin);
-  printf("DNN Energy:                 %.5f (%.5f [K])\n", E.DNN_E,
-         E.DNN_E * Constants.energy_to_kelvin);
-  if (SystemComponents.UseDNNforHostGuest) {
-    printf(" --> Stored Classical Host-Guest Interactions: \n");
-    printf("     VDW:             %.5f (%.5f [K])\n", E.storedHGVDW,
-           E.storedHGVDW * Constants.energy_to_kelvin);
-    printf("     Real Coulomb:    %.5f (%.5f [K])\n", E.storedHGReal,
-           E.storedHGReal * Constants.energy_to_kelvin);
-    printf("     Ewald:           %.5f (%.5f [K])\n", E.storedHGEwaldE,
-           E.storedHGEwaldE * Constants.energy_to_kelvin);
-    printf("     Total:           %.5f (%.5f [K])\n",
-           E.storedHGVDW + E.storedHGReal + E.storedHGEwaldE,
-           (E.storedHGVDW + E.storedHGReal + E.storedHGEwaldE) *
-               Constants.energy_to_kelvin);
-    printf(" --> DNN - Classical: %.5f (%.5f [K])\n",
-           E.DNN_E - (E.storedHGVDW + E.storedHGReal + E.storedHGEwaldE),
-           (E.DNN_E - (E.storedHGVDW + E.storedHGReal + E.storedHGEwaldE)) *
-               Constants.energy_to_kelvin);
-  }
-  printf("Tail Correction Energy:     %.5f (%.5f [K])\n", E.TailE,
-         E.TailE * Constants.energy_to_kelvin);
-  printf("Total Energy:               %.5f (%.5f [K])\n", E.total(),
-         E.total() * Constants.energy_to_kelvin);
-  printf("====================================================================="
-         "===\n");
+  printf("========================================================================\n");
+  printf("VDW [Host-Host]:            %.5f (%.5f [K])\n", E.HHVDW, E.HHVDW * Constants.energy_to_kelvin);
+  printf("VDW [Host-Guest]:           %.5f (%.5f [K])\n", E.HGVDW, E.HGVDW * Constants.energy_to_kelvin);
+  printf("VDW [Guest-Guest]:          %.5f (%.5f [K])\n", E.GGVDW, E.GGVDW * Constants.energy_to_kelvin);
+  printf("Real Coulomb [Host-Host]:   %.5f (%.5f [K])\n", E.HHReal, E.HHReal * Constants.energy_to_kelvin);
+  printf("Real Coulomb [Host-Guest]:  %.5f (%.5f [K])\n", E.HGReal, E.HGReal * Constants.energy_to_kelvin);
+  printf("Real Coulomb [Guest-Guest]: %.5f (%.5f [K])\n", E.GGReal, E.GGReal * Constants.energy_to_kelvin);
+  //double HHEwaldE_Net = (stage_name.find("STAGE") != std::string::npos) ? E.HHEwaldE - SystemComponents.InitialFrameworkEwald : E.HHEwaldE;
+  printf("Ewald [Host-Host]:          %.5f (%.5f [K])\n", E.HHEwaldE, E.HHEwaldE * Constants.energy_to_kelvin);
+  //Zhao's note: Minus initial framework Ewald E (usually the intra-molecular + self-correction of the framework component zero) //
+  if(stage_name == "INITIAL STAGE" || stage_name == "CREATE MOLECULE STAGE" || stage_name == "FINAL STAGE")
+    {
+      double HHEwaldE_include_frameworkzero = E.HHEwaldE + SystemComponents.InitialFrameworkEwald;
+      printf(" --> Total Ewald [Host-Host]:\n      %.5f (%.5f [K])\n", HHEwaldE_include_frameworkzero, HHEwaldE_include_frameworkzero * Constants.energy_to_kelvin);
+      printf(" --> Initial Ewald [Host-Host] (excluded):\n      %.5f (%.5f [K])\n", SystemComponents.InitialFrameworkEwald, SystemComponents.InitialFrameworkEwald * Constants.energy_to_kelvin);
+    } 
+  printf("Ewald [Host-Guest]:         %.5f (%.5f [K])\n", E.HGEwaldE, E.HGEwaldE * Constants.energy_to_kelvin);
+  printf("Ewald [Guest-Guest]:        %.5f (%.5f [K])\n", E.GGEwaldE, E.GGEwaldE * Constants.energy_to_kelvin);
+  printf("DNN Energy:                 %.5f (%.5f [K])\n", E.DNN_E, E.DNN_E * Constants.energy_to_kelvin);
+  if(SystemComponents.UseDNNforHostGuest)
+    {
+      printf(" --> Stored Classical Host-Guest Interactions: \n");
+      printf("     VDW:             %.5f (%.5f [K])\n", E.storedHGVDW, E.storedHGVDW * Constants.energy_to_kelvin);
+      printf("     Real Coulomb:    %.5f (%.5f [K])\n", E.storedHGReal, E.storedHGReal * Constants.energy_to_kelvin);
+      printf("     Ewald:           %.5f (%.5f [K])\n", E.storedHGEwaldE, E.storedHGEwaldE * Constants.energy_to_kelvin);
+      printf("     Total:           %.5f (%.5f [K])\n", E.storedHGVDW + E.storedHGReal + E.storedHGEwaldE, (E.storedHGVDW + E.storedHGReal + E.storedHGEwaldE) * Constants.energy_to_kelvin);
+      printf(" --> DNN - Classical: %.5f (%.5f [K])\n", E.DNN_E - (E.storedHGVDW + E.storedHGReal + E.storedHGEwaldE), (E.DNN_E - (E.storedHGVDW + E.storedHGReal + E.storedHGEwaldE)) * Constants.energy_to_kelvin);
+    }
+  printf("Tail Correction Energy:     %.5f (%.5f [K])\n", E.TailE, E.TailE * Constants.energy_to_kelvin);
+  printf("Total Energy:               %.5f (%.5f [K])\n", E.total(), E.total() * Constants.energy_to_kelvin);
+  printf("========================================================================\n");
 }
 inline void ENERGY_SUMMARY(std::vector<Components> &SystemComponents,
                            Units &Constants) {

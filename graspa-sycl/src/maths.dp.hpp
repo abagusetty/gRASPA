@@ -244,14 +244,20 @@ void operator +=(MoveEnergy& A, MoveEnergy B)
   A.storedHGReal    += B.storedHGReal;
   A.storedHGEwaldE  += B.storedHGEwaldE;
 
-  A.HGVDW     += B.HGVDW;
-  A.HGReal    += B.HGReal;
-  A.GGVDW     += B.GGVDW;
-  A.GGReal    += B.GGReal;
-  A.EwaldE    += B.EwaldE;
-  A.HGEwaldE  += B.HGEwaldE;
-  A.TailE     += B.TailE;
-  A.DNN_E     += B.DNN_E;
+  A.HHVDW    += B.HHVDW;
+  A.HGVDW    += B.HGVDW;
+  A.GGVDW    += B.GGVDW;
+
+  A.HHReal   += B.HHReal;
+  A.HGReal   += B.HGReal;
+  A.GGReal   += B.GGReal;
+
+  A.HHEwaldE += B.HHEwaldE;
+  A.HGEwaldE += B.HGEwaldE;
+  A.GGEwaldE += B.GGEwaldE;
+
+  A.TailE    += B.TailE;
+  A.DNN_E    += B.DNN_E;
 }
 
 void operator -=(MoveEnergy& A, MoveEnergy B)
@@ -259,15 +265,21 @@ void operator -=(MoveEnergy& A, MoveEnergy B)
   A.storedHGVDW     -= B.storedHGVDW;
   A.storedHGReal    -= B.storedHGReal;
   A.storedHGEwaldE  -= B.storedHGEwaldE;
+  
+  A.HHVDW    -= B.HHVDW;
+  A.HGVDW    -= B.HGVDW;
+  A.GGVDW    -= B.GGVDW;
 
-  A.HGVDW     -= B.HGVDW;
-  A.HGReal    -= B.HGReal;
-  A.GGVDW     -= B.GGVDW;
-  A.GGReal    -= B.GGReal;
-  A.EwaldE    -= B.EwaldE;
-  A.HGEwaldE  -= B.HGEwaldE;
-  A.TailE     -= B.TailE;
-  A.DNN_E     -= B.DNN_E;
+  A.HHReal   -= B.HHReal;
+  A.HGReal   -= B.HGReal;
+  A.GGReal   -= B.GGReal;
+
+  A.HHEwaldE -= B.HHEwaldE;
+  A.HGEwaldE -= B.HGEwaldE;
+  A.GGEwaldE -= B.GGEwaldE;
+
+  A.TailE    -= B.TailE;
+  A.DNN_E    -= B.DNN_E;
 }
 
 MoveEnergy operator +(MoveEnergy A, MoveEnergy B)

@@ -39,7 +39,6 @@ Insertion_Body(Components &SystemComponents, Simulations &Sims, ForceField &FF,
   //Determine whether to accept or reject the insertion
   preFactor = GetPrefactor(SystemComponents, Sims, SelectedComponent, INSERTION);
   //Ewald Correction, done on HOST (CPU) //
-  bool EwaldCPU = false;
   int MoveType = INSERTION; //Normal Insertion, including fractional insertion, no previous step (do not use temprorary totalEik)//
   if(previous_step) //Fractional Insertion after a lambda change move that makes the old fractional molecule full//
   {
@@ -48,18 +47,11 @@ Insertion_Body(Components &SystemComponents, Simulations &Sims, ForceField &FF,
   bool EwaldPerformed = false;
   if(!FF.noCharges && SystemComponents.hasPartialCharge[SelectedComponent])
   {
-    double EwaldE = 0.0;
-    if(EwaldCPU)
-    {
-      //EwaldE = CPU_EwaldDifference(Sims.Box, Sims.New, Sims.Old, FF, SystemComponents, SelectedComponent, true, SelectedTrial);
-    }
-    else
-    {
-      EwaldE = GPU_EwaldDifference_General(Sims.Box, Sims.d_a, Sims.New, Sims.Old, FF, Sims.Blocksum, SystemComponents, SelectedComponent, MoveType, SelectedTrial, newScale);
-    }
-    energy.EwaldE = EwaldE;
-    energy.HGEwaldE=SystemComponents.tempdeltaHGEwald;
-    Rosenbluth *= std::exp(-SystemComponents.Beta * (EwaldE + energy.HGEwaldE));
+    double2 EwaldE = GPU_EwaldDifference_General(Sims.Box, Sims.d_a, Sims.New, Sims.Old, FF, Sims.Blocksum, SystemComponents, SelectedComponent, INSERTION, SelectedTrial, newScale);
+
+    energy.GGEwaldE = EwaldE.x();
+    energy.HGEwaldE = EwaldE.y();
+    Rosenbluth *= std::exp(-SystemComponents.Beta * (EwaldE.x() + EwaldE.y()));
     EwaldPerformed = true;
   }
   double TailE = 0.0;
@@ -135,15 +127,16 @@ static inline MoveEnergy Deletion_Body(Components& SystemComponents, Simulations
   preFactor = GetPrefactor(SystemComponents, Sims, SelectedComponent, DELETION);
 
   UpdateLocation = SelectedMolInComponent * SystemComponents.Moleculesize[SelectedComponent];
-  double EwaldE = 0.0;
   bool EwaldPerformed = false;
   if(!FF.noCharges && SystemComponents.hasPartialCharge[SelectedComponent])
   {
-    EwaldE      = GPU_EwaldDifference_General(Sims.Box, Sims.d_a, Sims.New, Sims.Old, FF, Sims.Blocksum, SystemComponents, SelectedComponent, DELETION, UpdateLocation, newScale);
-    Rosenbluth /= std::exp(-SystemComponents.Beta * (EwaldE + SystemComponents.tempdeltaHGEwald));
-    energy.EwaldE= -1.0 * (EwaldE);
-    energy.HGEwaldE= -1.0*SystemComponents.tempdeltaHGEwald; //Becareful with the sign here, you need a HG sum, but HGVDWReal and HGEwaldE here have opposite signs???//
-    EwaldPerformed = true;
+    int MoveType = DELETION;
+
+    double2 EwaldE = GPU_EwaldDifference_General(Sims.Box, Sims.d_a, Sims.New, Sims.Old, FF, Sims.Blocksum, SystemComponents, SelectedComponent, MoveType, UpdateLocation, newScale);
+    Rosenbluth /= std::exp(-SystemComponents.Beta * (EwaldE.x() + EwaldE.y()));
+    energy.GGEwaldE = -1.0 * EwaldE.x();
+    energy.HGEwaldE = -1.0 * EwaldE.y(); //Becareful with the sign here, you need a HG sum, but HGVDWReal and HGEwaldE here have opposite signs???//
+    EwaldPerformed  = true;
   }
   double TailE = 0.0;
   TailE = TailCorrectionDifference(SystemComponents, SelectedComponent, FF.size, Sims.Box.Volume, DELETION);

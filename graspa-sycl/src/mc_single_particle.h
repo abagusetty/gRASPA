@@ -93,27 +93,11 @@ static inline MoveEnergy SingleBodyMove(Components& SystemComponents, Simulation
 
   //Zhao's note: possible bug, you may only need 3 instead of 3 * N random numbers//
   Random.Check(Molsize);
-  /*
-  DPCT1049:0: The work-group size passed to the SYCL kernel may exceed the
-  limit. To get the device limit, query info::device::max_work_group_size.
-  Adjust the work-group size if needed.
-  */
-  /*
-  DPCT1069:67: The argument 'Sims' of the kernel function contains virtual
-  pointer(s), which cannot be dereferenced. Try to migrate the code with
-  "usm-level=restricted".
-  */
-  /*
-  DPCT1069:68: The argument 'FF' of the kernel function contains virtual
-  pointer(s), which cannot be dereferenced. Try to migrate the code with
-  "usm-level=restricted".
-  */
-  que.parallel_for(sycl::nd_range<1>(Molsize, Molsize),
-                   [=](sycl::nd_item<1> item) {
-                     get_new_position(Sims, FF, start_position,
-                                      SelectedComponent, Random.device_random, Max,
-                                      Random.offset, MoveType, item);
-                   }).wait();
+  que.parallel_for(sycl::nd_range<1>(Molsize, Molsize), [=](sycl::nd_item<1> item) {
+    get_new_position(Sims, FF, start_position,
+                     SelectedComponent, Random.device_random, Max,
+                     Random.offset, MoveType, item);
+  }).wait();
   Random.Update(Molsize);
 
   // Setup for the pairwise calculation //
@@ -193,13 +177,22 @@ static inline MoveEnergy SingleBodyMove(Components& SystemComponents, Simulation
     tot.HGVDW = hg_vdw; tot.HGReal = hg_real; tot.GGVDW = gg_vdw; tot.GGReal = gg_real;
 
     // Calculate Ewald //
-    
     bool EwaldPerformed = false;
     if(!FF.noCharges && SystemComponents.hasPartialCharge[SelectedComponent])
     {
       double2 newScale = SystemComponents.Lambda[SelectedComponent].SET_SCALE(1.0);
-      tot.EwaldE = GPU_EwaldDifference_General(Sims.Box, Sims.d_a, Sims.New, Sims.Old, FF, Sims.Blocksum, SystemComponents, SelectedComponent, MoveType, 0, newScale);
-      tot.HGEwaldE=SystemComponents.tempdeltaHGEwald;
+      double2 EwaldE = GPU_EwaldDifference_General(Sims.Box, Sims.d_a, Sims.New, Sims.Old, FF, Sims.Blocksum, SystemComponents, SelectedComponent, MoveType, 0, newScale);
+      if(HH_Nblock == 0)
+      {
+        tot.GGEwaldE = EwaldE.x();
+        tot.HGEwaldE = EwaldE.y();
+      }
+      else
+      {
+        tot.HHEwaldE = EwaldE.x();
+        tot.HGEwaldE = EwaldE.y();
+        //printf("HHEwald: %.5f, HGEwald: %.5f\n", tot.HHEwaldE, tot.HGEwaldE);
+      }
       EwaldPerformed = true;
     }
     double preFactor = GetPrefactor(SystemComponents, Sims, SelectedComponent, MoveType);
@@ -222,15 +215,14 @@ static inline MoveEnergy SingleBodyMove(Components& SystemComponents, Simulation
     {
       if(Accept)
       {
-        que.parallel_for(sycl::nd_range<1>(Molsize, Molsize),
-                         [=](sycl::nd_item<1> item) {
-                           update_translation_position(Sims.d_a, Sims.New, start_position,
-                                                       SelectedComponent, item);
-                         }).wait();
+        que.parallel_for(sycl::nd_range<1>(Molsize, Molsize), [=](sycl::nd_item<1> item) {
+          update_translation_position(Sims.d_a, Sims.New, start_position,
+                                      SelectedComponent, item);
+        }).wait();
         SystemComponents.Moves[SelectedComponent].TranslationAccepted ++;
         if(!FF.noCharges && SystemComponents.hasPartialCharge[SelectedComponent])
         {
-          Update_Ewald_Vector(Sims.Box, false, SystemComponents);
+          Update_Vector_Ewald(Sims.Box, false, SystemComponents);
         }
       }
       else {tot.zero(); };
@@ -241,16 +233,14 @@ static inline MoveEnergy SingleBodyMove(Components& SystemComponents, Simulation
     {
       if(Accept)
       {
-        que.parallel_for(sycl::nd_range<1>(Molsize, Molsize),
-                         [=](sycl::nd_item<1> item) {
-                           update_translation_position(
-                               Sims.d_a, Sims.New, start_position,
-                               SelectedComponent, item);
+        que.parallel_for(sycl::nd_range<1>(Molsize, Molsize), [=](sycl::nd_item<1> item) {
+          update_translation_position(Sims.d_a, Sims.New, start_position,
+                                      SelectedComponent, item);
                          }).wait();
         SystemComponents.Moves[SelectedComponent].RotationAccepted ++;
         if(!FF.noCharges && SystemComponents.hasPartialCharge[SelectedComponent])
         {
-          Update_Ewald_Vector(Sims.Box, false, SystemComponents);
+          Update_Vector_Ewald(Sims.Box, false, SystemComponents);
         }
       }
       else {tot.zero(); };

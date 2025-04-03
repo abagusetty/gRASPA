@@ -13,9 +13,9 @@
 #define DEFAULTTHREAD 128
 double Get_Uniform_Random();
 
-enum MoveTypes {TRANSLATION = 0, ROTATION, SINGLE_INSERTION, SINGLE_DELETION, INSERTION, DELETION, REINSERTION, CBCF_LAMBDACHANGE, CBCF_INSERTION, CBCF_DELETION, IDENTITY_SWAP};
+enum MoveTypes {TRANSLATION = 0, ROTATION, SINGLE_INSERTION, SINGLE_DELETION, SPECIAL_ROTATION, INSERTION, DELETION, REINSERTION, CBCF_LAMBDACHANGE, CBCF_INSERTION, CBCF_DELETION, IDENTITY_SWAP, WIDOM};
 
-enum CBMC_Types {CBMC_INSERTION = 0, CBMC_DELETION, REINSERTION_INSERTION, REINSERTION_RETRACE, IDENTITY_SWAP_NEW};
+enum CBMC_Types {CBMC_INSERTION = 0, CBMC_DELETION, REINSERTION_INSERTION, REINSERTION_RETRACE, IDENTITY_SWAP_NEW, IDENTITY_SWAP_OLD};
 
 enum SIMULATION_MODE {CREATE_MOLECULE = 0, INITIALIZATION, EQUILIBRATION, PRODUCTION};
 
@@ -27,8 +27,12 @@ enum ADD_MINUS_SIGNS {ADD = 0, MINUS};
 
 enum ROTATION_AXIS {X = 0, Y, Z, SELF_DEFINED};
 
+enum INTERACTION_TYPES {HH = 0, HG, GG};
+
+enum RESTART_FILE_TYPES {RASPA_RESTART = 0, LAMMPS_DATA};
+
 //Zhao's note: For the stage of evaluating total energy of the system//
-enum ENERGYEVALSTAGE {INITIAL = 0, CREATEMOL, FINAL, CREATEMOL_DELTA, DELTA, CREATEMOL_DELTA_CHECK, DELTA_CHECK, DRIFT};
+enum ENERGYEVALSTAGE {INITIAL = 0, CREATEMOL, FINAL, CREATEMOL_DELTA, DELTA, CREATEMOL_DELTA_CHECK, DELTA_CHECK, DRIFT, GPU_DRIFT, AVERAGE, AVERAGE_ERR};
 
 using int2 = sycl::vec<int, 2>;
 using int3 = sycl::vec<int, 3>;
@@ -456,31 +460,44 @@ struct Tail
 
 //Temporary energies for a move//
 //Zhao's note: consider making this the default return variable for moves, like RASPA-3?//
+//Temporary energies for a move//
+//Zhao's note: consider making this the default return variable for moves, like RASPA-3?//
 struct MoveEnergy
 {
-  double storedHGVDW={0.0};
-  double storedHGReal={0.0};
-  double storedHGEwaldE={0.0};
-  double HGVDW={0.0};
-  double GGVDW={0.0};
-  double HGReal={0.0};
-  double GGReal={0.0};
-  double HGEwaldE={0.0};
-  double EwaldE={0.0};
-  double TailE ={0.0};
-  double DNN_E ={0.0};
+  double storedHGVDW=0.0;
+  double storedHGReal=0.0;
+  double storedHGEwaldE=0.0;
+  // van der Waals //
+  double HHVDW=0.0;
+  double HGVDW=0.0;
+  double GGVDW=0.0;
+  // Real Part of Coulomb //
+  double HHReal=0.0;
+  double HGReal=0.0;
+  double GGReal=0.0;
+  // Long-Range Ewald Energy //
+  double HHEwaldE=0.0;
+  double HGEwaldE=0.0;
+  double GGEwaldE=0.0;
+  // Other Energies //
+  double TailE =0.0;
+  double DNN_E =0.0;
   double total()
   {
-    return HGVDW + GGVDW + HGReal + GGReal + EwaldE + HGEwaldE + TailE + DNN_E;
+    return HHVDW + HGVDW + GGVDW + 
+           HHReal + HGReal + GGReal + 
+           HHEwaldE + HGEwaldE + GGEwaldE + 
+           TailE + DNN_E;
   };
   void take_negative()
   {
     storedHGVDW *= -1.0;
     storedHGReal*= -1.0;
     storedHGEwaldE  *= -1.0;
+    HHVDW *= -1.0; HHReal *= -1.0;
     HGVDW *= -1.0; HGReal *= -1.0;
     GGVDW *= -1.0; GGReal *= -1.0;
-    EwaldE    *= -1.0; HGEwaldE  *= -1.0;
+    HHEwaldE *= -1.0; HGEwaldE *= -1.0; GGEwaldE  *= -1.0;
     TailE     *= -1.0;
     DNN_E     *= -1.0;
   };
@@ -489,26 +506,32 @@ struct MoveEnergy
     storedHGVDW =0.0;
     storedHGReal=0.0;
     storedHGEwaldE=0.0;
+    HHVDW=0.0; HHReal=0.0;
     HGVDW=0.0; HGReal=0.0;
     GGVDW=0.0; GGReal=0.0;
-    EwaldE   =0.0;
+    HHEwaldE =0.0;
     HGEwaldE =0.0;
+    GGEwaldE =0.0;
     TailE    =0.0;
     DNN_E    =0.0;
   };
   void print()
   {
-    printf("HGVDW: %.5f, HGReal: %.5f, GGVDW: %.5f, GGReal: %.5f, EwaldE: %.5f, HGEwaldE: %.5f, TailE: %.5f, DNN_E: %.5f\n", HGVDW, HGReal, GGVDW, GGReal, EwaldE, HGEwaldE, TailE, DNN_E);
+    printf("HHVDW: %.5f, HHReal: %.5f, HGVDW: %.5f, HGReal: %.5f, GGVDW: %.5f, GGReal: %.5f, HHEwaldE: %.5f,\n HGEwaldE: %.5f,\n GGEwaldE: %.5f, TailE: %.5f, DNN_E: %.5f\n", HHVDW, HHReal, HGVDW, HGReal, GGVDW, GGReal, HHEwaldE, HGEwaldE, GGEwaldE, TailE, DNN_E);
+    printf("Stored HGVDW: %.5f, Stored HGReal: %.5f, Stored HGEwaldE: %.5f\n", storedHGVDW, storedHGReal, storedHGEwaldE);
   };
-  double DNN_Correction() //Using DNN energy to replace HGVDW, HGReal and HGEwaldE//
+  void DNN_Replace_Energy()
   {
-    double correction = DNN_E - HGVDW - HGReal - HGEwaldE;
-    storedHGVDW = HGVDW; 
+    storedHGVDW = HGVDW;
     storedHGReal= HGReal;
     storedHGEwaldE  = HGEwaldE;
-    HGVDW = 0.0; 
+    HGVDW = 0.0;
     HGReal= 0.0;
     HGEwaldE = 0.0;
+  }
+  double DNN_Correction() //Using DNN energy to replace HGVDW, HGReal and HGEwaldE//
+  {
+    double correction = DNN_E - storedHGVDW - storedHGReal - storedHGEwaldE;
     return correction;
   };
 };
@@ -526,6 +549,7 @@ struct Atoms
   size_t   Allocate_size;
 };
 
+//###Struct to contain almost all data on the CPU for the simulation###//
 struct Components
 {
   size_t  Total_Components;                           // Number of Components in the system (including framework)
@@ -542,11 +566,14 @@ struct Components
   size_t  TotalNumberOfMolecules;                     // Total Number of Molecules (including framework)
   size_t  NumberOfFrameworks;                         // Total Number of framework species, usually 1.
   double  Temperature={0.0};
+  double  Pressure=0.0;                               // In internal unit
+  double  Pressure_Pa=0.0;                            // In units of Pascal (simulation.input unit)//
   double  Beta;                                       // Inverse Temperature 
   double  tempdeltaHGEwald={0.0};
   MoveEnergy Initial_Energy;
   MoveEnergy CreateMol_Energy;
   MoveEnergy Final_Energy;
+  MoveEnergy GPU_Energy;
   Atoms*  HostSystem;                                 //CPU pointers for storing Atoms (d_a in Simulations is the GPU Counterpart)//
   Atoms   TempSystem;                                 //For temporary data storage//
   void Copy_GPU_Data_To_Temp(Atoms GPU_System, size_t start, size_t size)
@@ -576,13 +603,13 @@ struct Components
                 size * sizeof(size_t))
         .wait();
   }
-  MoveEnergy tempdeltaE;
   MoveEnergy CreateMoldeltaE;
   MoveEnergy deltaE;
-  double  FrameworkEwald={0.0};
-  bool    HasTailCorrection = {false};                // An overall flag for tail correction 
-  bool    ReadRestart = {false};                      // Whether to use restart files (RestartInitial)
-  bool    SingleSwap={false};
+  double  FrameworkEwald=0.0;        //calculated at every stage (initial, create molecule, final)
+  double  InitialFrameworkEwald=0.0; //calculated ONLY at initial stage, then stored//
+  bool    HasTailCorrection = false;                // An overall flag for tail correction
+  bool    ReadRestart = false;                      // Whether to use restart files //Zhao's note: this can be either RASPA-2-type Restart file or LAMMPS data file //
+  bool    SingleSwap=false;
   //DNN Related Variables//
   size_t Nfeatures;
   //std::vector<cppflow::model> DNNModel;
@@ -636,9 +663,10 @@ struct Components
   std::vector<std::complex<double>> eik_x;  
   std::vector<std::complex<double>> eik_y;
   std::vector<std::complex<double>> eik_z;
-  std::vector<std::complex<double>> storedEik;        // Stored Ewald Vector
-  std::vector<std::complex<double>> totalEik; 
-  std::vector<std::complex<double>> FrameworkEik;
+  std::vector<std::complex<double>> AdsorbateEik;        // Stored Ewald Vectors for Adsorbate
+  std::vector<std::complex<double>> FrameworkEik;        // Stored Ewald Vectors for Framework
+  std::vector<std::complex<double>> tempEik;             // Ewald Vector for temporary storage
+  size_t StructureFactor_Multiplier = 2;                 // Add extra structure factor storage for volume moves//
   void UpdatePseudoAtoms(int MoveType, size_t component)
   {
     switch(MoveType)
@@ -667,26 +695,44 @@ struct Components
   }
 };
 
+struct ForceField
+{
+  double* epsilon;
+  double* sigma;
+  double* z; // a third term
+  double* shift;
+  int*    FFType; //type of force field calculation  
+  bool    noCharges;
+  bool    VDWRealBias = true; //By default, the CBMC moves use VDW + Real Biasing//
+  size_t  size;
+  double  OverlapCriteria;
+  double  CutOffVDW;       // Square of cutoff for vdW interaction //
+  double  CutOffCoul;      // Square of cutoff for Coulombic interaction //
+  //double  Prefactor;
+  //double  Alpha;
+};
+
 struct Boxsize
 {
   Complex* eik_x;
   Complex* eik_y;
   Complex* eik_z;
-  Complex* storedEik;
-  Complex* totalEik;
+  Complex* AdsorbateEik;
   Complex* FrameworkEik;
+  Complex* tempEik;
+  Complex* tempFrameworkEik;
 
   double*  Cell;
   double*  InverseCell;
-  double   Pressure;
   double   Volume;
   double   ReciprocalCutOff;
   double   Prefactor;
   double   Alpha;
   double   tol1; //For Ewald, see read_Ewald_Parameters_from_input function//
+  
   bool     Cubic;
-  bool     ExcludeHostGuestEwald = {false};
-  int3 kmax;
+  bool     UseLAMMPSEwald = false;
+  int3     kmax;
 };
 
 struct Simulations //For multiple simulations//
@@ -717,23 +763,6 @@ struct PseudoAtomDefinitions //Always a host struct, never on the device
   std::vector<double> mass;
   std::vector<double> charge;
   std::vector<double> polar; //polarizability
-};
-
-struct ForceField
-{
-  double* epsilon;
-  double* sigma;
-  double* z; // a third term
-  double* shift;
-  int*    FFType; //type of force field calculation  
-  bool    noCharges;
-  bool    VDWRealBias = {true}; //By default, the CBMC moves use VDW + Real Biasing//
-  size_t  size;
-  double  OverlapCriteria;
-  double  CutOffVDW;       // Square of cutoff for vdW interaction //
-  double  CutOffCoul;      // Square of cutoff for Coulombic interaction //
-  //double  Prefactor;
-  //double  Alpha;
 };
 
 struct WidomStruct

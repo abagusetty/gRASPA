@@ -200,7 +200,7 @@ int main(void)
     ///////////////////////////////////////////////////////////////////
     // Calculate & Initialize Ewald for the Initial state of the box //
     ///////////////////////////////////////////////////////////////////
-    Check_Simulation_Energy(Box[a], SystemComponents[a].HostSystem, FF, device_FF, SystemComponents[a], INITIAL, a, Sims[a]);
+    Check_Simulation_Energy(Box[a], SystemComponents[a].HostSystem, FF, device_FF, SystemComponents[a], INITIAL, a, Sims[a], true);
     //////////////////////////////////////////////////////////
     // CREATE MOLECULES IN THE BOX BEFORE SIMULAITON STARTS //
     //////////////////////////////////////////////////////////
@@ -264,7 +264,7 @@ int main(void)
     printf("======================================\n");
     printf("CHECKING FINAL ENERGY FOR SYSTEM [%zu]\n", i);
     printf("======================================\n");
-    Check_Simulation_Energy(Box[i], SystemComponents[i].HostSystem, FF, device_FF, SystemComponents[i], FINAL, i, Sims[i]);
+    Check_Simulation_Energy(Box[i], SystemComponents[i].HostSystem, FF, device_FF, SystemComponents[i], FINAL, i, Sims[i], true);
     printf("======================================\n");
   }
   /////////////////////////////////////////////////////////

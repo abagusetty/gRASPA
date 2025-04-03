@@ -5,31 +5,23 @@
 #include "lambda.h"
 #include <cmath>
 
-void StoreNewLocation_Reinsertion(Atoms Mol, Atoms NewMol, double3 *temp,
-                                  size_t SelectedTrial, size_t Moleculesize)
+__attribute__((always_inline)) void StoreNewLocation_Reinsertion(Atoms Mol, Atoms NewMol, double3* temp, size_t SelectedTrial, size_t Moleculesize, const sycl::nd_item<1> &item)
 {
-  if(Moleculesize == 1) //Only first bead is inserted, first bead data is stored in NewMol
+  size_t i = item.get_global_id(0);
+  if(i == 0)
   {
-    temp[0] = NewMol.pos[SelectedTrial];
+    if(Moleculesize == 1) temp[0] = NewMol.pos[SelectedTrial];
+    else temp[0] = Mol.pos[0];
   }
-  else //Multiple beads: first bead + trial orientations
+  else
   {
-    //Update the first bead, first bead data stored in position 0 of Mol //
-    temp[0] = Mol.pos[0];
-   
     size_t chainsize = Moleculesize - 1; // FOr trial orientations //
-    for(size_t i = 0; i < chainsize; i++) //Update the selected orientations//
-    {
-      size_t selectsize = SelectedTrial*chainsize+i;
-      temp[i+1] = NewMol.pos[selectsize];
-    }
+    size_t selectsize = SelectedTrial*chainsize+(i-1);
+    temp[i] = NewMol.pos[selectsize];
   }
-  /*
-  for(size_t i = 0; i < Moleculesize; i++)
-    printf("i: %lu, xyz: %.5f %.5f %.5f\n", i, temp[i].x(), temp[i].y(), temp[i].z());
-  */
 }
 
+__attribute__((always_inline))
 void Update_Reinsertion_data(Atoms *d_a, double3 *temp,
                              size_t SelectedComponent, size_t UpdateLocation,
                              const sycl::nd_item<1> &item)
@@ -39,154 +31,6 @@ void Update_Reinsertion_data(Atoms *d_a, double3 *temp,
   d_a[SelectedComponent].pos[realLocation] = temp[i];
 }
 
-static inline MoveEnergy Reinsertion(Components& SystemComponents, Simulations& Sims, ForceField& FF, RandomNumber& Random, WidomStruct& Widom, size_t SelectedMolInComponent, size_t SelectedComponent)
-{
-  sycl::queue &que = *sycl_get_queue();
-  //Get Number of Molecules for this component (For updating TMMC)//
-  double NMol = SystemComponents.NumberOfMolecule_for_Component[SelectedComponent];
-  if(SystemComponents.hasfractionalMolecule[SelectedComponent]) NMol--;
-
-  SystemComponents.Moves[SelectedComponent].ReinsertionTotal ++;
-  bool SuccessConstruction = false;
-  size_t SelectedTrial = 0;
-  MoveEnergy energy; MoveEnergy old_energy; double StoredR = 0.0;
- 
-  ///////////////
-  // INSERTION //
-  ///////////////
-  int CBMCType = REINSERTION_INSERTION; //Reinsertion-Insertion//
-  double2 newScale = SystemComponents.Lambda[SelectedComponent].SET_SCALE(1.0); // Zhao's note: not used in reinsertion, just set to 1.0//
-  double Rosenbluth=Widom_Move_FirstBead_PARTIAL(SystemComponents, Sims, FF, Random, Widom, SelectedMolInComponent, SelectedComponent, CBMCType, StoredR, &SelectedTrial, &SuccessConstruction, &energy, newScale); //Not reinsertion, not Retrace//
-
-  if(Rosenbluth <= 1e-150) SuccessConstruction = false; //Zhao's note: added this protection bc of weird error when testing GibbsParticleXfer
-
-  if(!SuccessConstruction)
-  {
-    SystemComponents.Tmmc[SelectedComponent].Update(1.0, NMol, REINSERTION);
-    energy.zero();
-    return energy;
-  }
-
-  //DEBUG//
-  /*
-  if(SystemComponents.CURRENTCYCLE == 2)
-  {printf("REINSERTION MOVE (comp: %zu, Mol: %zu) FIRST BEAD INSERTION ENERGY: ", SelectedComponent, SelectedMolInComponent); energy.print();
-   printf("Rosen: %.5f\n", Rosenbluth);
-  }
-  */
- 
-  if(SystemComponents.Moleculesize[SelectedComponent] > 1)
-  {
-    size_t SelectedFirstBeadTrial = SelectedTrial; 
-    MoveEnergy temp_energy = energy;
-    Rosenbluth*=Widom_Move_Chain_PARTIAL(SystemComponents, Sims, FF, Random, Widom, SelectedMolInComponent, SelectedComponent, CBMCType, &SelectedTrial, &SuccessConstruction, &energy, SelectedFirstBeadTrial, newScale); //True for doing insertion for reinsertion, different in MoleculeID//
-    if(Rosenbluth <= 1e-150) SuccessConstruction = false; //Zhao's note: added this protection bc of weird error when testing GibbsParticleXfer
-    if(!SuccessConstruction)
-    { 
-      SystemComponents.Tmmc[SelectedComponent].Update(1.0, NMol, REINSERTION);
-      energy.zero();
-      return energy;
-    }
-    energy += temp_energy;
-  }
-
-  /*
-  if(SystemComponents.CURRENTCYCLE == 2) 
-  {printf("REINSERTION MOVE, INSERTION ENERGY: "); energy.print();
-   printf("Rosen: %.5f\n", Rosenbluth);
-  }
-  */
-
-  //Store The New Locations//
-  auto SystemComponents_Moleculesize_SelectedComponent_ct4 = SystemComponents.Moleculesize[SelectedComponent];
-  que.parallel_for(
-      sycl::nd_range<3>(sycl::range<3>(1, 1, 1), sycl::range<3>(1, 1, 1)),
-      [=](sycl::nd_item<3> item) {
-        StoreNewLocation_Reinsertion(
-            Sims.Old, Sims.New, Sims.temp, SelectedTrial,
-            SystemComponents_Moleculesize_SelectedComponent_ct4);
-      });
-  /////////////
-  // RETRACE //
-  /////////////
-  CBMCType = REINSERTION_RETRACE; //Reinsertion-Retrace//
-  double Old_Rosen=Widom_Move_FirstBead_PARTIAL(SystemComponents, Sims, FF, Random, Widom, SelectedMolInComponent, SelectedComponent, CBMCType, StoredR, &SelectedTrial, &SuccessConstruction, &old_energy, newScale);
-
-  /*
-  if(SystemComponents.CURRENTCYCLE == 2)
-  {printf("REINSERTION MOVE (comp: %zu, Mol: %zu) FIRST BEAD DELETION ENERGY: ", SelectedComponent, SelectedMolInComponent); old_energy.print();
-   printf("Rosen: %.5f\n", Old_Rosen);
-  }
-  */
-
-
-  if(SystemComponents.Moleculesize[SelectedComponent] > 1)
-  {
-    size_t SelectedFirstBeadTrial = SelectedTrial;
-    MoveEnergy temp_energy = old_energy;
-    Old_Rosen*=Widom_Move_Chain_PARTIAL(SystemComponents, Sims, FF, Random, Widom, SelectedMolInComponent, SelectedComponent, CBMCType, &SelectedTrial, &SuccessConstruction, &old_energy, SelectedFirstBeadTrial, newScale);
-    old_energy += temp_energy;
-  } 
-
-  /*
-  if(SystemComponents.CURRENTCYCLE == 2)
-  {printf("REINSERTION MOVE, DELETION ENERGY: "); old_energy.print();
-   printf("Rosen: %.5f\n", Old_Rosen);
-  }
-  */
-
-  energy -= old_energy;
-
-  //Calculate Ewald//
-  double EwaldE = 0.0;
-  size_t UpdateLocation = SystemComponents.Moleculesize[SelectedComponent] * SelectedMolInComponent;
-
-  bool EwaldPerformed = false;
-  if(!FF.noCharges && SystemComponents.hasPartialCharge[SelectedComponent])
-  {
-    EwaldE = GPU_EwaldDifference_Reinsertion(Sims.Box, Sims.d_a, Sims.Old, Sims.temp, FF, Sims.Blocksum, SystemComponents, SelectedComponent, UpdateLocation);
-
-    energy.EwaldE = EwaldE;
-    energy.HGEwaldE=SystemComponents.tempdeltaHGEwald;
-    Rosenbluth *= std::exp(-SystemComponents.Beta * (EwaldE + energy.HGEwaldE));
-    EwaldPerformed = true;
-  }
-
-  //printf("Reinsertion Energy: "); energy.print();
-
-  //Determine whether to accept or reject the insertion
-  double RANDOM = Get_Uniform_Random();
-  //printf("RANDOM: %.5f, Rosenbluth / Old_Rosen: %.5f\n", RANDOM, Rosenbluth / Old_Rosen);
-  if(RANDOM < Rosenbluth / Old_Rosen)
-  { // accept the move
-    SystemComponents.Moves[SelectedComponent].ReinsertionAccepted ++;
-    //size_t UpdateLocation = SystemComponents.Moleculesize[SelectedComponent] * SelectedMolInComponent;
-    /*
-    DPCT1049:10: The work-group size passed to the SYCL kernel may exceed the
-    limit. To get the device limit, query info::device::max_work_group_size.
-    Adjust the work-group size if needed.
-    */
-    que.parallel_for(
-                     sycl::nd_range<1>(SystemComponents.Moleculesize[SelectedComponent], SystemComponents.Moleculesize[SelectedComponent]),
-                     [=](sycl::nd_item<1> item) {
-                       Update_Reinsertion_data(Sims.d_a, Sims.temp, SelectedComponent,
-                                               UpdateLocation, item);
-                     });
-    checkCUDAError("error Updating Reinsertion data");
-
-    if(!FF.noCharges && SystemComponents.hasPartialCharge[SelectedComponent]) 
-      Update_Ewald_Vector(Sims.Box, false, SystemComponents);
-    SystemComponents.Tmmc[SelectedComponent].Update(1.0, NMol, REINSERTION); //Update for TMMC, since Macrostate not changed, just add 1.//
-    //energy.print();
-    return energy;
-  }
-  else
-  {
-    SystemComponents.Tmmc[SelectedComponent].Update(1.0, NMol, REINSERTION); //Update for TMMC, since Macrostate not changed, just add 1.//
-    energy.zero();
-    return energy;
-  }
-}
 
 //Zhao's note: added feature for creating fractional molecules//
 static inline MoveEnergy
@@ -225,7 +69,7 @@ CreateMolecule(Components &SystemComponents, Simulations &Sims, ForceField &FF,
 
     if(!FF.noCharges && SystemComponents.hasPartialCharge[SelectedComponent])
     {
-      Update_Ewald_Vector(Sims.Box, false, SystemComponents);
+      Update_Vector_Ewald(Sims.Box, false, SystemComponents);
     }
     Update_NumberOfMolecules(SystemComponents, Sims.d_a, SelectedComponent, INSERTION);
     return energy;
@@ -576,14 +420,13 @@ static inline MoveEnergy IdentitySwapMove(Components& SystemComponents, Simulati
   energy -= old_energy;
 
   //Calculate Ewald//
-  double EwaldE = 0.0;
   size_t UpdateLocation = SystemComponents.Moleculesize[OLDComponent] * OLDMolInComponent;
   if(!FF.noCharges)
   {
-    EwaldE = GPU_EwaldDifference_IdentitySwap(Sims.Box, Sims.d_a, Sims.Old, Sims.temp, FF, Sims.Blocksum, SystemComponents, OLDComponent, NEWComponent, UpdateLocation);
-    energy.EwaldE = EwaldE;
-    energy.HGEwaldE=SystemComponents.tempdeltaHGEwald;
-    Rosenbluth *= std::exp(-SystemComponents.Beta * (EwaldE + energy.HGEwaldE));
+    double2 EwaldE = GPU_EwaldDifference_IdentitySwap(Sims.Box, Sims.d_a, Sims.Old, Sims.temp, FF, Sims.Blocksum, SystemComponents, OLDComponent, NEWComponent, UpdateLocation);
+    energy.GGEwaldE = EwaldE.x();
+    energy.HGEwaldE = EwaldE.y();
+    Rosenbluth *= std::exp(-SystemComponents.Beta * (EwaldE.x() + EwaldE.y()));
   }
 
   energy.TailE = TailCorrectionIdentitySwap(SystemComponents, NEWComponent, OLDComponent, FF.size, Sims.Box.Volume);
@@ -641,7 +484,7 @@ static inline MoveEnergy IdentitySwapMove(Components& SystemComponents, Simulati
     Update_NumberOfMolecules(SystemComponents, Sims.d_a, OLDComponent, DELETION);
 
     if(!FF.noCharges && ((SystemComponents.hasPartialCharge[NEWComponent]) ||(SystemComponents.hasPartialCharge[OLDComponent])))
-      Update_Ewald_Vector(Sims.Box, false, SystemComponents);
+      Update_Vector_Ewald(Sims.Box, false, SystemComponents);
     //energy.print();
     return energy;
   }
